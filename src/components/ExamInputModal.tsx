@@ -14,6 +14,8 @@ import {
   ClipboardPaste,
   FileCheck,
   CheckCircle2,
+  XCircle,
+  Layers,
 } from 'lucide-react';
 
 interface ExamInputModalProps {
@@ -34,6 +36,15 @@ export const ExamInputModal: React.FC<ExamInputModalProps> = ({
 
   // Thêm phần: Số lượng đề cần tạo (mặc định 1, giáo viên có thể chọn 1, 2, 3, 4 hoặc tự nhập)
   const [variantCount, setVariantCount] = useState<number>(1);
+
+  // 3 Dạng cấu trúc đề thi theo yêu cầu:
+  // auto: Tự động nhận diện theo đề mẫu
+  // dang_1_tu_luan: Dạng 1 - 100% Tự luận
+  // dang_2_trac_nghiem_tu_luan: Dạng 2 - Trắc nghiệm + Tự luận
+  // dang_3_chuan_bo_4_dang: Dạng 3 - Chuẩn 4 dạng Bộ GD&ĐT
+  const [targetStructureType, setTargetStructureType] = useState<
+    'auto' | 'dang_1_tu_luan' | 'dang_2_trac_nghiem_tu_luan' | 'dang_3_chuan_bo_4_dang'
+  >('auto');
 
   // Môn học, Khối lớp (1-12), Hình thức thi & Thời gian làm bài
   const [subject, setSubject] = useState<string>('Toán học');
@@ -62,6 +73,7 @@ export const ExamInputModal: React.FC<ExamInputModalProps> = ({
 
   const imageInputRef = useRef<HTMLInputElement>(null);
   const docInputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Lắng nghe sự kiện Dán ảnh (Ctrl + V) toàn cục khi mở modal
   useEffect(() => {
@@ -216,6 +228,17 @@ export const ExamInputModal: React.FC<ExamInputModalProps> = ({
     }
   };
 
+  // Nút HỦY TẠO ĐỀ ngay lập tức
+  const handleCancelProcess = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+    setLoadingStep('');
+    setError('Đã hủy quá trình tạo đề thành công. Bạn có thể chọn ảnh/tài liệu khác hoặc làm lại đề mới.');
+  };
+
   // Bắt đầu xử lý OCR đề gốc & Chuẩn bị sinh số lượng đề phát triển
   const handleProcessExam = async () => {
     setError(null);
@@ -231,6 +254,9 @@ export const ExamInputModal: React.FC<ExamInputModalProps> = ({
       );
       return;
     }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     setLoading(true);
     setLoadingStep('Đang quét toàn diện 100% nội dung tài liệu từ Câu 1 đến câu cuối...');
@@ -259,19 +285,25 @@ export const ExamInputModal: React.FC<ExamInputModalProps> = ({
 
       const effectiveSubject = isCustomSubject && customSubjectText.trim() ? customSubjectText.trim() : subject;
 
-      const res = await authFetch('/api/exam/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          images: payloadImages,
-          textContent: payloadText,
-          subject: effectiveSubject,
-          grade,
-          examType,
-          timeAllowed,
-          notes: 'Quét 100% toàn bộ câu hỏi từ Câu 1 đến câu cuối cùng của đề thi mẫu.',
-        }),
-      });
+      const res = await authFetch(
+        '/api/exam/analyze',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            images: payloadImages,
+            textContent: payloadText,
+            subject: effectiveSubject,
+            grade,
+            examType,
+            timeAllowed,
+            targetStructureType: targetStructureType !== 'auto' ? targetStructureType : undefined,
+            notes: 'Quét 100% toàn bộ câu hỏi từ Câu 1 đến câu cuối cùng của đề thi mẫu.',
+          }),
+          signal: controller.signal,
+        },
+        1
+      );
 
       const json = await res.json();
       if (json.success && json.data) {
@@ -290,10 +322,15 @@ export const ExamInputModal: React.FC<ExamInputModalProps> = ({
         setError(json.error || 'Lỗi khi phân tích đề thi.');
       }
     } catch (err: any) {
-      setError(err.message || 'Lỗi kết nối máy chủ khảo thí.');
+      if (err?.name === 'AbortError' || controller.signal.aborted) {
+        setError('Đã hủy tạo đề thành công theo yêu cầu của bạn.');
+      } else {
+        setError(err.message || 'Lỗi kết nối máy chủ khảo thí.');
+      }
     } finally {
       clearTimeout(timer1);
       clearTimeout(timer2);
+      abortControllerRef.current = null;
       setLoading(false);
       setLoadingStep('');
     }
@@ -452,6 +489,93 @@ export const ExamInputModal: React.FC<ExamInputModalProps> = ({
                     </button>
                   </div>
                 )}
+              </div>
+            </div>
+
+            {/* NHẬN DIỆN 3 DẠNG CẤU TRÚC ĐỀ THI */}
+            <div className="pt-2 border-t border-slate-200/80">
+              <label className="block text-xs font-bold text-slate-800 mb-2 flex items-center gap-1.5">
+                <Layers className="h-3.5 w-3.5 text-blue-600" />
+                <span>Dạng Cấu Trúc Đề Thi:</span>
+                <span className="text-[11px] text-slate-500 font-normal">(Hệ thống tự nhận diện hoặc bạn có thể chọn trước)</span>
+              </label>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                {/* Tự động */}
+                <button
+                  type="button"
+                  onClick={() => setTargetStructureType('auto')}
+                  className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                    targetStructureType === 'auto'
+                      ? 'border-blue-600 bg-blue-50/80 ring-1 ring-blue-500 font-bold text-blue-900 shadow-2xs'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold">✨ Tự Động Nhận Diện</span>
+                    {targetStructureType === 'auto' && <CheckCircle2 className="h-4 w-4 text-blue-600" />}
+                  </div>
+                  <div className="text-[11px] text-slate-500 font-normal mt-0.5">
+                    Hệ thống quét đề và phân loại đúng dạng 1, 2 hoặc 3
+                  </div>
+                </button>
+
+                {/* Dạng 1: Tự luận */}
+                <button
+                  type="button"
+                  onClick={() => setTargetStructureType('dang_1_tu_luan')}
+                  className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                    targetStructureType === 'dang_1_tu_luan'
+                      ? 'border-blue-600 bg-blue-50/80 ring-1 ring-blue-500 font-bold text-blue-900 shadow-2xs'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold">📝 Dạng 1: 100% Tự Luận</span>
+                    {targetStructureType === 'dang_1_tu_luan' && <CheckCircle2 className="h-4 w-4 text-blue-600" />}
+                  </div>
+                  <div className="text-[11px] text-slate-500 font-normal mt-0.5">
+                    Chỉ gồm các bài toán tự luận (không có trắc nghiệm)
+                  </div>
+                </button>
+
+                {/* Dạng 2: Trắc nghiệm & Tự luận */}
+                <button
+                  type="button"
+                  onClick={() => setTargetStructureType('dang_2_trac_nghiem_tu_luan')}
+                  className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                    targetStructureType === 'dang_2_trac_nghiem_tu_luan'
+                      ? 'border-blue-600 bg-blue-50/80 ring-1 ring-blue-500 font-bold text-blue-900 shadow-2xs'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold">⚖️ Dạng 2: Trắc Nghiệm & Tự Luận</span>
+                    {targetStructureType === 'dang_2_trac_nghiem_tu_luan' && <CheckCircle2 className="h-4 w-4 text-blue-600" />}
+                  </div>
+                  <div className="text-[11px] text-slate-500 font-normal mt-0.5">
+                    Gồm 2 phần: Trắc nghiệm 4 lựa chọn + Tự luận
+                  </div>
+                </button>
+
+                {/* Dạng 3: Chuẩn 4 dạng Bộ GD&ĐT */}
+                <button
+                  type="button"
+                  onClick={() => setTargetStructureType('dang_3_chuan_bo_4_dang')}
+                  className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                    targetStructureType === 'dang_3_chuan_bo_4_dang'
+                      ? 'border-blue-600 bg-blue-50/80 ring-1 ring-blue-500 font-bold text-blue-900 shadow-2xs'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold">🎯 Dạng 3: Chuẩn 4 Dạng Bộ GD&ĐT</span>
+                    {targetStructureType === 'dang_3_chuan_bo_4_dang' && <CheckCircle2 className="h-4 w-4 text-blue-600" />}
+                  </div>
+                  <div className="text-[11px] text-slate-500 font-normal mt-0.5">
+                    TN 4 chọn, Đúng/Sai, Trả lời ngắn, Tự luận
+                  </div>
+                </button>
               </div>
             </div>
           </div>
@@ -642,14 +766,25 @@ export const ExamInputModal: React.FC<ExamInputModalProps> = ({
             </div>
           )}
 
-          {/* Loading Indicator */}
+          {/* Loading Indicator kèm nút Hủy Tạo Đề */}
           {loading && (
-            <div className="rounded-2xl border border-blue-200 bg-blue-50/70 p-5 text-center space-y-2">
+            <div className="rounded-2xl border border-blue-200 bg-blue-50/70 p-5 text-center space-y-3">
               <Loader2 className="h-7 w-7 animate-spin text-blue-600 mx-auto" />
               <div className="text-xs font-bold text-blue-900">{loadingStep}</div>
               <p className="text-[11px] text-blue-700/80">
                 Đang bảo toàn mục I, II, III, IV & Câu 1, Câu 2... in đậm màu xanh dương
               </p>
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={handleCancelProcess}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 active:bg-rose-800 text-white px-4 py-2 text-xs font-bold shadow-md shadow-rose-200 transition-all cursor-pointer"
+                  title="Dừng xử lý tài liệu này để làm lại đề mới hoặc đưa tài liệu khác lên"
+                >
+                  <XCircle className="h-4 w-4" />
+                  <span>HỦY TẠO ĐỀ (DỪNG LẠI)</span>
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -658,30 +793,31 @@ export const ExamInputModal: React.FC<ExamInputModalProps> = ({
         <div className="border-t border-slate-100 bg-slate-50 px-6 py-3.5 flex items-center justify-between shrink-0">
           <button
             type="button"
-            onClick={onClose}
+            onClick={loading ? handleCancelProcess : onClose}
             className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-700 hover:bg-slate-100 transition-colors"
           >
-            Đóng
+            {loading ? 'Đóng / Hủy' : 'Đóng'}
           </button>
 
-          <button
-            type="button"
-            onClick={handleProcessExam}
-            disabled={loading}
-            className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-2.5 text-xs font-bold text-white hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 transition-all shadow-md shadow-blue-200"
-          >
-            {loading ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <span>Đang Xử Lý...</span>
-              </>
-            ) : (
-              <>
-                <Sparkles className="h-4 w-4" />
-                <span>Bắt Đầu Xử Lý & Tạo {variantCount} Đề</span>
-              </>
-            )}
-          </button>
+          {loading ? (
+            <button
+              type="button"
+              onClick={handleCancelProcess}
+              className="flex items-center gap-2 rounded-xl bg-rose-600 px-6 py-2.5 text-xs font-bold text-white hover:bg-rose-700 active:bg-rose-800 transition-all shadow-md shadow-rose-200 cursor-pointer animate-pulse"
+            >
+              <XCircle className="h-4 w-4" />
+              <span>HỦY TẠO ĐỀ</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleProcessExam}
+              className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-2.5 text-xs font-bold text-white hover:bg-blue-700 active:bg-blue-800 transition-all shadow-md shadow-blue-200 cursor-pointer"
+            >
+              <Sparkles className="h-4 w-4" />
+              <span>Bắt Đầu Xử Lý & Tạo {variantCount} Đề</span>
+            </button>
+          )}
         </div>
       </div>
     </div>

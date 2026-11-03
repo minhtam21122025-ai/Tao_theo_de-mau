@@ -1,6 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ExamData } from './types/exam';
-import { UserAccount } from './types/auth';
 import { authFetch } from './utils/apiClient';
 import { Header } from './components/Header';
 import { ExamViewer } from './components/ExamViewer';
@@ -8,7 +7,6 @@ import { MatrixViewer } from './components/MatrixViewer';
 import { SideBySideComparison } from './components/SideBySideComparison';
 import { ExamInputModal } from './components/ExamInputModal';
 import { VariantGeneratorModal } from './components/VariantGeneratorModal';
-import { UserManagementModal } from './components/UserManagementModal';
 import { exportExamToWord } from './utils/docxExport';
 import {
   Sparkles,
@@ -25,22 +23,10 @@ import {
   Cpu,
   Download,
   Layers,
+  XCircle,
 } from 'lucide-react';
 
 export default function App() {
-  // Tài khoản Quản trị viên mặc định (Đã bỏ đăng nhập để vào thẳng ứng dụng ổn định)
-  const [currentUser] = useState<UserAccount>({
-    id: 'admin_daotam28',
-    username: 'daotam28',
-    role: 'admin',
-    createdAt: new Date().toISOString(),
-    expiryDate: null,
-    isActive: true,
-    displayName: 'Quản trị viên Hệ thống',
-    note: 'Tài khoản truy cập trực tiếp không cần đăng nhập',
-  });
-  const [isUserManagementOpen, setIsUserManagementOpen] = useState<boolean>(false);
-
   // Trạng thái đề thi
   const [originalExam, setOriginalExam] = useState<ExamData | null>(null);
   const [equivalentExams, setEquivalentExams] = useState<ExamData[]>([]);
@@ -51,6 +37,10 @@ export default function App() {
   const [isGenerateModalOpen, setIsGenerateModalOpen] = useState<boolean>(false);
   const [isBatchGenerating, setIsBatchGenerating] = useState<boolean>(false);
   const [batchProgress, setBatchProgress] = useState<string>('');
+
+  // Điều khiển hủy tạo đề tức thì
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const isCancelledRef = useRef<boolean>(false);
 
   const currentEquivalent = equivalentExams[selectedVariantIndex] || null;
 
@@ -83,6 +73,17 @@ export default function App() {
     }
   };
 
+  // Hàm dừng / hủy tạo đề ngay lập tức
+  const handleCancelGeneration = () => {
+    isCancelledRef.current = true;
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsBatchGenerating(false);
+    setBatchProgress('');
+  };
+
   // Xử lý sau khi OCR đề gốc thành công và tự động sinh số lượng đề phát triển yêu cầu
   const handleAnalyzeSuccess = async (newExam: ExamData, requestedCount: number = 1) => {
     setOriginalExam(newExam);
@@ -91,35 +92,48 @@ export default function App() {
 
     // Nếu người dùng yêu cầu tạo số lượng đề (ví dụ 1, 2, 3...)
     if (requestedCount > 0) {
+      isCancelledRef.current = false;
       setIsBatchGenerating(true);
       const generatedList: ExamData[] = [];
       const failedIndices: number[] = [];
 
       for (let i = 1; i <= requestedCount; i++) {
+        if (isCancelledRef.current) break;
+
         const codeNum = 100 + i;
-        setBatchProgress(`Đang biên soạn Đề ${codeNum} (Mã đề: ${codeNum}) bám sát cấu trúc đề mẫu & biến đổi sang các hình học khác nhau...`);
+        setBatchProgress(`Đang biên soạn Đề ${codeNum} (Mã đề: ${codeNum}) bám sát cấu trúc đề mẫu & biến đổi sang các hình học khác nhau... (${i}/${requestedCount})`);
 
         let success = false;
         let attempt = 0;
         const maxVariantAttempts = 2;
 
-        while (!success && attempt < maxVariantAttempts) {
+        while (!success && attempt < maxVariantAttempts && !isCancelledRef.current) {
           attempt++;
           try {
-            const res = await authFetch('/api/exam/generate-equivalent', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                originalExam: newExam,
-                variantIndex: i,
-                customization: {
-                  difficulty: 'Chuẩn 100% tương đương',
-                  contextStyle: 'Đời sống thực tế Việt Nam',
-                },
-              }),
-            });
+            const controller = new AbortController();
+            abortControllerRef.current = controller;
+
+            const res = await authFetch(
+              '/api/exam/generate-equivalent',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  originalExam: newExam,
+                  variantIndex: i,
+                  customization: {
+                    difficulty: 'Chuẩn 100% tương đương',
+                    contextStyle: 'Đời sống thực tế Việt Nam',
+                  },
+                }),
+                signal: controller.signal,
+              },
+              0
+            );
 
             const json = await res.json();
+            if (isCancelledRef.current) break;
+
             if (json.success && json.data) {
               json.data.examCode = `MÃ ĐỀ: ${codeNum}`;
               json.data.title = `Đề thi môn ${newExam.subject || 'Toán'} - ${newExam.grade || 'Lớp 12'}`;
@@ -128,30 +142,36 @@ export default function App() {
               success = true;
             } else {
               console.warn(`Lỗi khi tạo đề số ${i} (lần thử ${attempt}):`, json.error);
-              if (attempt < maxVariantAttempts) {
+              if (attempt < maxVariantAttempts && !isCancelledRef.current) {
                 setBatchProgress(`Đang thử lại Đề ${codeNum}...`);
                 await new Promise((r) => setTimeout(r, 400));
               }
             }
           } catch (e: any) {
+            if (isCancelledRef.current || e?.name === 'AbortError') {
+              break;
+            }
             console.error(`Lỗi mạng khi tạo đề số ${i} (lần thử ${attempt}):`, e);
-            if (attempt < maxVariantAttempts) {
+            if (attempt < maxVariantAttempts && !isCancelledRef.current) {
               setBatchProgress(`Đang kết nối lại để tạo Đề ${codeNum}...`);
               await new Promise((r) => setTimeout(r, 400));
             }
           }
         }
 
+        if (isCancelledRef.current) break;
+
         if (!success) {
           failedIndices.push(codeNum);
         }
 
         // Tạm nghỉ 200ms giữa các lần sinh để tăng tốc độ tối đa
-        if (i < requestedCount) {
+        if (i < requestedCount && !isCancelledRef.current) {
           await new Promise((r) => setTimeout(r, 200));
         }
       }
 
+      abortControllerRef.current = null;
       setIsBatchGenerating(false);
       setBatchProgress('');
 
@@ -160,7 +180,7 @@ export default function App() {
         setActiveTab('equivalent');
       }
 
-      if (failedIndices.length > 0) {
+      if (failedIndices.length > 0 && !isCancelledRef.current) {
         alert(
           `Đã hoàn thành ${generatedList.length}/${requestedCount} đề thi. ` +
           `Các đề chưa tạo được (Mã: ${failedIndices.join(', ')}). Bạn có thể bấm nút "Sinh thêm Đề" để tạo bổ sung nhé!`
@@ -185,23 +205,35 @@ export default function App() {
     if (!originalExam) return;
     const nextIdx = equivalentExams.length + 1;
     const nextCode = 100 + nextIdx;
+    isCancelledRef.current = false;
     setIsBatchGenerating(true);
     setBatchProgress(`Đang biên soạn Đề ${nextCode} (Mã đề: ${nextCode})...`);
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
-      const res = await authFetch('/api/exam/generate-equivalent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          originalExam,
-          variantIndex: nextIdx,
-          customization: {
-            difficulty: 'Chuẩn 100% tương đương',
-            contextStyle: 'Đời sống thực tế Việt Nam',
-          },
-        }),
-      });
+      const res = await authFetch(
+        '/api/exam/generate-equivalent',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            originalExam,
+            variantIndex: nextIdx,
+            customization: {
+              difficulty: 'Chuẩn 100% tương đương',
+              contextStyle: 'Đời sống thực tế Việt Nam',
+            },
+          }),
+          signal: controller.signal,
+        },
+        1
+      );
 
       const json = await res.json();
+      if (isCancelledRef.current) return;
+
       if (json.success && json.data) {
         json.data.examCode = `MÃ ĐỀ: ${nextCode}`;
         json.data.title = `Đề thi môn ${originalExam.subject || 'Toán'} - ${originalExam.grade || 'Lớp 12'}`;
@@ -210,8 +242,11 @@ export default function App() {
         alert(json.error || `Lỗi khi tạo Đề ${nextCode}. Vui lòng thử lại.`);
       }
     } catch (e: any) {
-      alert(`Lỗi kết nối khi tạo Đề ${nextCode}: ${e?.message || 'Vui lòng thử lại.'}`);
+      if (!isCancelledRef.current && e?.name !== 'AbortError') {
+        alert(`Lỗi kết nối khi tạo Đề ${nextCode}: ${e?.message || 'Vui lòng thử lại.'}`);
+      }
     } finally {
+      abortControllerRef.current = null;
       setIsBatchGenerating(false);
       setBatchProgress('');
     }
@@ -232,6 +267,7 @@ export default function App() {
   // Xóa đề hiện tại để tải đề mới
   const handleClearCurrentExam = () => {
     if (window.confirm('Bạn có chắc muốn xóa đề hiện tại để đưa đề khác lên?')) {
+      handleCancelGeneration();
       setOriginalExam(null);
       setEquivalentExams([]);
       setActiveTab('original');
@@ -240,7 +276,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-['Be_Vietnam_Pro',sans-serif]">
-      {/* Header với thông tin người dùng và phân quyền admin */}
+      {/* Header điều hướng và tác vụ chính */}
       <Header
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -252,16 +288,30 @@ export default function App() {
         onPrint={handlePrint}
         isGenerating={isBatchGenerating}
         examTitle={originalExam?.title}
-        currentUser={currentUser}
-        onOpenUserManagement={() => setIsUserManagementOpen(true)}
-        onLogout={handleLogout}
+        onResetExam={handleClearCurrentExam}
+        onCancelGenerate={handleCancelGeneration}
       />
 
-      {/* Thông báo tiến trình sinh hàng loạt nếu đang chạy */}
+      {/* Thông báo tiến trình sinh hàng loạt kèm NÚT HỦY TẠO ĐỀ NỔI BẬT */}
       {isBatchGenerating && (
-        <div className="bg-blue-600 text-white text-xs font-bold py-2.5 px-4 text-center flex items-center justify-center gap-2 shadow-sm no-print">
-          <Loader2 className="h-4 w-4 animate-spin text-white" />
-          <span>{batchProgress}</span>
+        <div className="bg-gradient-to-r from-blue-700 via-indigo-700 to-blue-800 text-white text-xs font-bold py-3 px-4 shadow-md no-print sticky top-16 z-20 animate-fadeIn">
+          <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <Loader2 className="h-4 w-4 animate-spin text-blue-200 shrink-0" />
+              <span className="leading-tight text-white">{batchProgress}</span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleCancelGeneration}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 active:bg-rose-800 px-4 py-2 text-xs font-black text-white shadow-md shadow-rose-900/30 transition-all border border-rose-400 cursor-pointer animate-pulse"
+                title="Dừng ngay lập tức việc tạo đề để làm lại đề mới hoặc tạo đề khác"
+              >
+                <XCircle className="h-4 w-4" />
+                <span>HỦY TẠO ĐỀ (DỪNG LẠI)</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -549,15 +599,6 @@ export default function App() {
           originalExam={originalExam}
           onGenerateSuccess={handleGenerateSuccess}
           variantCount={equivalentExams.length}
-        />
-      )}
-
-      {/* Modal Quản lý tài khoản (Chỉ dành cho Admin: daotam28) */}
-      {currentUser.role === 'admin' && (
-        <UserManagementModal
-          isOpen={isUserManagementOpen}
-          onClose={() => setIsUserManagementOpen(false)}
-          currentUser={currentUser}
         />
       )}
     </div>

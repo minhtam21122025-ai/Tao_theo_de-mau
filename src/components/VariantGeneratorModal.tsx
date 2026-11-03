@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { ExamData, ExamVariantConfig } from '../types/exam';
-import { Sparkles, Sliders, X, Check, Loader2, AlertCircle, Award } from 'lucide-react';
+import { Sparkles, Sliders, X, Check, Loader2, AlertCircle, Award, XCircle } from 'lucide-react';
 import { authFetch } from '../utils/apiClient';
 
 interface VariantGeneratorModalProps {
@@ -30,10 +30,25 @@ export const VariantGeneratorModal: React.FC<VariantGeneratorModalProps> = ({
   const [loading, setLoading] = useState<boolean>(false);
   const [loadingStep, setLoadingStep] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   if (!isOpen) return null;
 
+  // Hủy tiến trình sinh đề tương đương
+  const handleCancelGenerate = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+    setLoadingStep('');
+    setError('Đã hủy quá trình tạo đề theo yêu cầu của bạn.');
+  };
+
   const handleGenerate = async () => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setLoading(true);
     setError(null);
     setLoadingStep('Đang khởi tạo thuật toán sinh đề phát triển số ' + variantIndex + '...');
@@ -58,15 +73,20 @@ export const VariantGeneratorModal: React.FC<VariantGeneratorModalProps> = ({
         note,
       };
 
-      const res = await authFetch('/api/exam/generate-equivalent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          originalExam,
-          variantIndex,
-          customization,
-        }),
-      });
+      const res = await authFetch(
+        '/api/exam/generate-equivalent',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            originalExam,
+            variantIndex,
+            customization,
+          }),
+          signal: controller.signal,
+        },
+        1
+      );
 
       const json = await res.json();
       if (json.success && json.data) {
@@ -78,11 +98,16 @@ export const VariantGeneratorModal: React.FC<VariantGeneratorModalProps> = ({
         setError(json.error || 'Lỗi khi sinh đề thi tương đương.');
       }
     } catch (err: any) {
-      setError(err.message || 'Lỗi kết nối máy chủ khảo thí.');
+      if (err?.name === 'AbortError' || controller.signal.aborted) {
+        setError('Đã hủy tạo đề theo yêu cầu.');
+      } else {
+        setError(err.message || 'Lỗi kết nối máy chủ khảo thí.');
+      }
     } finally {
       clearTimeout(timer1);
       clearTimeout(timer2);
       clearTimeout(timer3);
+      abortControllerRef.current = null;
       setLoading(false);
       setLoadingStep('');
     }
@@ -236,12 +261,23 @@ export const VariantGeneratorModal: React.FC<VariantGeneratorModalProps> = ({
 
           {/* Loading status */}
           {loading && (
-            <div className="rounded-xl border border-indigo-100 bg-indigo-50/80 p-4 text-center space-y-2">
+            <div className="rounded-xl border border-indigo-100 bg-indigo-50/80 p-4 text-center space-y-3">
               <Loader2 className="h-6 w-6 animate-spin text-indigo-600 mx-auto" />
               <div className="text-xs font-bold text-indigo-900">{loadingStep}</div>
               <p className="text-[11px] text-indigo-700/80">
                 Đang biên soạn đề tương đương chuẩn mực, chuyển đổi các dạng hình học và sinh mã SVG...
               </p>
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={handleCancelGenerate}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 active:bg-rose-800 text-white px-4 py-1.5 text-xs font-bold shadow-md shadow-rose-200 transition-all cursor-pointer"
+                  title="Dừng việc tạo đề này ngay lập tức"
+                >
+                  <XCircle className="h-4 w-4" />
+                  <span>HỦY TẠO ĐỀ (DỪNG LẠI)</span>
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -249,28 +285,31 @@ export const VariantGeneratorModal: React.FC<VariantGeneratorModalProps> = ({
         {/* Footer */}
         <div className="border-t border-slate-100 bg-slate-50 px-6 py-3 flex items-center justify-between">
           <button
-            onClick={onClose}
+            type="button"
+            onClick={loading ? handleCancelGenerate : onClose}
             className="rounded-lg border border-slate-200 bg-white px-4 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 transition-colors"
           >
-            Hủy
+            {loading ? 'Đóng / Hủy' : 'Đóng'}
           </button>
-          <button
-            onClick={handleGenerate}
-            disabled={loading}
-            className="flex items-center gap-2 rounded-lg bg-indigo-600 px-5 py-2 text-xs font-bold text-white hover:bg-indigo-700 disabled:opacity-50 transition-all shadow-xs"
-          >
-            {loading ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <span>Đang Biên Soạn...</span>
-              </>
-            ) : (
-              <>
-                <Sparkles className="h-4 w-4" />
-                <span>Tiến Hành Sinh Đề Tương Đương</span>
-              </>
-            )}
-          </button>
+          {loading ? (
+            <button
+              type="button"
+              onClick={handleCancelGenerate}
+              className="flex items-center gap-2 rounded-lg bg-rose-600 px-5 py-2 text-xs font-bold text-white hover:bg-rose-700 active:bg-rose-800 transition-all shadow-md shadow-rose-200 cursor-pointer animate-pulse"
+            >
+              <XCircle className="h-4 w-4" />
+              <span>HỦY TẠO ĐỀ</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleGenerate}
+              className="flex items-center gap-2 rounded-lg bg-indigo-600 px-5 py-2 text-xs font-bold text-white hover:bg-indigo-700 transition-all shadow-xs cursor-pointer"
+            >
+              <Sparkles className="h-4 w-4" />
+              <span>Tiến Hành Sinh Đề Tương Đương</span>
+            </button>
+          )}
         </div>
       </div>
     </div>

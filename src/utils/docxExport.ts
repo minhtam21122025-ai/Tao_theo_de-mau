@@ -519,10 +519,17 @@ export async function exportExamToWord(exam: ExamData, isAnswerKeyIncluded: bool
     `;
 
     part.questions.forEach((q) => {
+      const isEssayQ = Boolean(
+        q.isEssay ||
+        ((!q.options || q.options.length === 0) &&
+         (!q.subQuestions || q.subQuestions.length === 0) &&
+         q.shortAnswer === undefined)
+      );
+
       html += `
       <div class="question-block">
         <div>
-          <span class="question-head">Câu ${q.questionNumber}:</span> 
+          <span class="question-head">Câu ${q.questionNumber}${q.points !== undefined ? ` (${q.points} điểm)` : ''}:</span> 
           <span>${sanitize(q.content)}</span>
         </div>
       `;
@@ -567,6 +574,11 @@ export async function exportExamToWord(exam: ExamData, isAnswerKeyIncluded: bool
         html += `<div style="margin-top: 5pt; font-style: italic;">Đáp số: ....................................................</div>`;
       }
 
+      // Tự luận (Dạng 1 hoặc Phần Tự luận Dạng 2/Dạng 3)
+      if (isEssayQ) {
+        html += `<div style="margin-top: 5pt; font-style: italic; color: #475569;">[Học sinh trình bày bài làm và lập luận chi tiết các bước]</div>`;
+      }
+
       html += `</div>`;
     });
   });
@@ -602,9 +614,18 @@ export async function exportExamToWord(exam: ExamData, isAnswerKeyIncluded: bool
     html += `</tr><tr><td><strong>Đ/A</strong></td>`;
 
     allQuestions.forEach((q) => {
+      const isEssayItem = Boolean(
+        q.isEssay ||
+        ((!q.options || q.options.length === 0) &&
+         (!q.subQuestions || q.subQuestions.length === 0) &&
+         q.shortAnswer === undefined)
+      );
+
       let ans = q.correctAnswer || '-';
       if (q.subQuestions && q.subQuestions.length > 0) {
         ans = q.subQuestions.map((sq) => `${sq.key}:${sq.isCorrect ? 'Đ' : 'S'}`).join(' ');
+      } else if (isEssayItem) {
+        ans = 'T.Luận';
       }
       html += `<td><strong>${sanitize(ans)}</strong></td>`;
     });

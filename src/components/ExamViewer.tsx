@@ -19,6 +19,7 @@ import {
   Edit3,
   Check,
   Settings2,
+  PenLine,
 } from 'lucide-react';
 
 interface ExamViewerProps {
@@ -175,6 +176,11 @@ export const ExamViewer: React.FC<ExamViewerProps> = ({
               >
                 {isEquivalent ? 'ĐỀ THI TƯƠNG ĐƯƠNG (ĐỀ PHÁT TRIỂN)' : 'ĐỀ THI GỐC ĐÃ CHUẨN HÓA'}
               </span>
+              {exam.examStructureLabel && (
+                <span className="rounded-full bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 text-[11px] font-bold text-emerald-800 shadow-2xs">
+                  {exam.examStructureLabel}
+                </span>
+              )}
               {exam.examCode && (
                 <span className="text-xs font-semibold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-md">
                   {exam.examCode}
@@ -399,6 +405,13 @@ export const ExamViewer: React.FC<ExamViewerProps> = ({
                       ? showAllExplanations || expandedExplanations[q.questionNumber]
                       : submitted;
 
+                  const isEssay = Boolean(
+                    q.isEssay ||
+                    ((!q.options || q.options.length === 0) &&
+                     (!q.subQuestions || q.subQuestions.length === 0) &&
+                     q.shortAnswer === undefined)
+                  );
+
                   return (
                     <div
                       key={`p_${part.partId || pIdx}_q_${q.questionNumber}_${qIdx}`}
@@ -410,11 +423,21 @@ export const ExamViewer: React.FC<ExamViewerProps> = ({
                           <span className="font-bold text-blue-600 mr-2 font-serif text-base inline-block">
                             Câu {q.questionNumber}:
                           </span>
+                          {q.points && (
+                            <span className="inline-block text-xs font-semibold text-purple-700 bg-purple-50 border border-purple-200 px-2 py-0.5 rounded mr-2">
+                              ({q.points} điểm)
+                            </span>
+                          )}
                           <MathRenderer content={q.content} />
                         </div>
 
                         {/* Badges & Actions */}
                         <div className="flex items-center gap-1.5 shrink-0 no-print">
+                          {isEssay && (
+                            <span className="rounded-full border border-purple-200 bg-purple-50 px-2 py-0.5 text-[10px] font-bold text-purple-700">
+                              Tự luận
+                            </span>
+                          )}
                           <span
                             className={`rounded-full border px-2 py-0.5 text-[10px] font-bold ${getCognitiveBadgeColor(
                               q.cognitiveLevel
@@ -569,6 +592,26 @@ export const ExamViewer: React.FC<ExamViewerProps> = ({
                         </div>
                       )}
 
+                      {/* Essay Question Container (Tự luận) */}
+                      {isEssay && (
+                        <div className="mt-3 rounded-xl border border-purple-200 bg-purple-50/40 p-3.5">
+                          <div className="flex items-center justify-between text-xs font-bold text-purple-900 mb-1.5">
+                            <span className="flex items-center gap-1.5">
+                              <PenLine className="h-4 w-4 text-purple-600" />
+                              <span>Bài Tự Luận {q.points ? `(${q.points} điểm)` : ''}</span>
+                            </span>
+                            <span className="text-[11px] font-normal text-purple-700 italic hidden sm:inline">
+                              Yêu cầu: Trình bày chi tiết các bước giải toán, lập luận và kết luận
+                            </span>
+                          </div>
+                          {viewMode === 'student' && !submitted && (
+                            <div className="mt-2 text-xs text-slate-600 italic bg-white/80 border border-purple-100 rounded-lg p-2.5">
+                              ✍️ Học sinh làm bài giải tự luận vào giấy thi hoặc vở. Sau đó nhấn <strong>"Nộp bài & Chấm điểm"</strong> hoặc chuyển sang <strong>"Chế độ Giáo Viên"</strong> để đối chiếu các bước giải chi tiết và đáp số.
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       {/* Step-by-Step Explanation Accordion */}
                       {isExpVisible && q.explanation && (
                         <div className="mt-4 rounded-xl border border-indigo-100 bg-indigo-50/50 p-3.5 text-xs sm:text-sm text-slate-800">
@@ -646,9 +689,18 @@ export const ExamViewer: React.FC<ExamViewerProps> = ({
                   <td className="p-2 border-r border-slate-200 text-slate-700">Đ/A</td>
                   {exam.parts.flatMap((p, pIdx) =>
                     p.questions.map((q, qIdx) => {
+                      const isEssayQ = Boolean(
+                        q.isEssay ||
+                        ((!q.options || q.options.length === 0) &&
+                         (!q.subQuestions || q.subQuestions.length === 0) &&
+                         q.shortAnswer === undefined)
+                      );
+
                       let ans = q.correctAnswer || '-';
                       if (q.subQuestions && q.subQuestions.length > 0) {
                         ans = q.subQuestions.map((sq) => (sq.isCorrect ? 'Đ' : 'S')).join('');
+                      } else if (isEssayQ) {
+                        ans = 'T.Luận';
                       }
                       return (
                         <td

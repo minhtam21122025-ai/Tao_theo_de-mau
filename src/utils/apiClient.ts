@@ -75,6 +75,9 @@ export async function authFetch(
 
       return response;
     } catch (err: any) {
+      if (err?.name === 'AbortError' || options.signal?.aborted) {
+        throw err;
+      }
       lastError = err;
       console.warn(`[authFetch] Lỗi mạng khi gọi ${url} (lần ${attempt + 1}/${maxRetries + 1}):`, err?.message || err);
       if (attempt < maxRetries) {

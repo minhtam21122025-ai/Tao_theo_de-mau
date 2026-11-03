@@ -513,49 +513,219 @@ app.delete(['/api/admin/users/:id', '/admin/users/:id'], requireAdmin, (req: Req
   }
 });
 
-// API: OCR and Analyze Exam Input - QUÉT TOÀN BỘ 100% NỘI DUNG ĐỀ THI
+// Helper: Nhận diện chính xác 1 trong 3 dạng cấu trúc đề thi theo yêu cầu:
+// - Dạng 1: Chỉ bao gồm các câu tự luận (100% Tự luận)
+// - Dạng 2: Có 2 phần: Trắc nghiệm (4 lựa chọn) và Tự luận
+// - Dạng 3: Đề gồm 4 dạng: Trắc nghiệm 4 lựa chọn, TN Đúng sai, TN trả lời ngắn, Tự luận (Chuẩn Bộ GD&ĐT 2018)
+function detectExamStructureType(exam: any): {
+  type: 'dang_1_tu_luan' | 'dang_2_trac_nghiem_tu_luan' | 'dang_3_chuan_bo_4_dang';
+  label: string;
+} {
+  if (!exam || !Array.isArray(exam.parts) || exam.parts.length === 0) {
+    return {
+      type: 'dang_2_trac_nghiem_tu_luan',
+      label: 'Dạng 2: Đề kết hợp 2 phần (Trắc nghiệm & Tự luận)',
+    };
+  }
+
+  const allQuestions = (exam.parts || []).flatMap((p: any) => p.questions || []);
+
+  const hasOptions = allQuestions.some((q: any) => Array.isArray(q.options) && q.options.length > 0);
+  const hasTrueFalse = allQuestions.some((q: any) => Array.isArray(q.subQuestions) && q.subQuestions.length > 0);
+  const hasShortAnswer = allQuestions.some(
+    (q: any) => q.shortAnswer !== undefined && q.shortAnswer !== null && String(q.shortAnswer).trim() !== ''
+  );
+  const hasEssay = allQuestions.some((q: any) => {
+    return (
+      q.isEssay === true ||
+      ((!q.options || q.options.length === 0) &&
+        (!q.subQuestions || q.subQuestions.length === 0) &&
+        (!q.shortAnswer || String(q.shortAnswer).trim() === ''))
+    );
+  });
+
+  const partTitles = (exam.parts || []).map((p: any) => (p.partTitle || '').toUpperCase());
+  const hasPartTF = partTitles.some((t: string) => t.includes('ĐÚNG SAI') || t.includes('ĐÚNG / SAI') || t.includes('ĐÚNG-SAI'));
+  const hasPartSA = partTitles.some((t: string) => t.includes('TRẢ LỜI NGẮN') || t.includes('ĐIỀN SỐ'));
+
+  // 1. Dạng 3: Đề chuẩn Bộ GD&ĐT 4 dạng (có câu Đúng/Sai HOẶC Trả lời ngắn, hoặc có tiêu đề phần Đúng Sai/Trả lời ngắn)
+  if (hasTrueFalse || hasShortAnswer || hasPartTF || hasPartSA) {
+    return {
+      type: 'dang_3_chuan_bo_4_dang',
+      label: 'Dạng 3: Đề chuẩn 4 dạng (Trắc nghiệm, Đúng/Sai, Trả lời ngắn, Tự luận)',
+    };
+  }
+
+  // 2. Dạng 1: Đề 100% Tự luận (KHÔNG có bất kỳ câu hỏi trắc nghiệm A, B, C, D nào)
+  if (!hasOptions && (hasEssay || allQuestions.length > 0)) {
+    return {
+      type: 'dang_1_tu_luan',
+      label: 'Dạng 1: Đề 100% Tự luận',
+    };
+  }
+
+  // 3. Dạng 2: Đề có 2 phần Trắc nghiệm & Tự luận (hoặc trắc nghiệm 4 lựa chọn truyền thống)
+  return {
+    type: 'dang_2_trac_nghiem_tu_luan',
+    label: 'Dạng 2: Đề kết hợp 2 phần (Trắc nghiệm & Tự luận)',
+  };
+}
+
+// Helper: Tạo bảng đặc tả chi tiết 1-1 của từng câu hỏi trong đề gốc để AI bám sát tuyệt đối theo đúng Dạng đề
+function formatOriginalExamForPrompt(originalExam: any): string {
+  if (!originalExam || !Array.isArray(originalExam.parts)) return '';
+  const detected = detectExamStructureType(originalExam);
+  const structureType = originalExam.examStructureType || detected.type;
+  const structureLabel = originalExam.examStructureLabel || detected.label;
+
+  let result = `=================================================================\n`;
+  result += `[CẤU TRÚC ĐỀ MẪU ĐÃ NHẬN DIỆN]: ${structureLabel} (Mã dạng: ${structureType})\n`;
+
+  if (structureType === 'dang_1_tu_luan') {
+    result += `>>> QUY TẮC BẮT BUỘC DẠNG 1 (100% TỰ LUẬN):
+    - Đề mẫu này là ĐỀ THI 100% TỰ LUẬN.
+    - Đề mới BẮT BUỘC PHẢI LÀ 100% CÂU TỰ LUẬN (Bài 1, Bài 2... hoặc Câu 1, Câu 2...).
+    - TUYỆT ĐỐI KHÔNG SINH CÂU TRẮC NGHIỆM A, B, C, D!
+    - Mỗi câu tự luận mới phải bám sát dạng toán và các ý $a), b), c)...$ tương ứng của câu gốc, đổi mới tham số, có biểu điểm và lời giải tự luận bài bản từng bước.\n`;
+  } else if (structureType === 'dang_2_trac_nghiem_tu_luan') {
+    result += `>>> QUY TẮC BẮT BUỘC DẠNG 2 (TRẮC NGHIỆM & TỰ LUẬN):
+    - Đề mẫu này gồm 2 PHẦN RÕ RỆT: Phần Trắc nghiệm nhiều phương án và Phần Tự luận.
+    - Đề mới BẮT BUỘC GIỮ ĐÚNG 2 PHẦN NÀY:
+      + PHẦN I: Trắc nghiệm 4 lựa chọn (A, B, C, D) với số lượng câu tương ứng 1-1.
+      + PHẦN II: Tự luận (các bài toán giải tự luận chi tiết từng bước) với số lượng bài tương ứng 1-1.\n`;
+  } else {
+    result += `>>> QUY TẮC BẮT BUỘC DẠNG 3 (CHUẨN BỘ GD&ĐT 4 DẠNG):
+    - Đề mẫu theo định dạng Đánh giá năng lực / Tốt nghiệp THPT chuẩn 4 dạng.
+    - Đề mới BẮT BUỘC GIỮ ĐÚNG CÁC PHẦN:
+      + PHẦN I: Trắc nghiệm nhiều phương án (4 lựa chọn A, B, C, D).
+      + PHẦN II: Trắc nghiệm Đúng/Sai (Mỗi câu gồm đúng 4 ý con a, b, c, d với boolean isCorrect).
+      + PHẦN III: Trắc nghiệm Trả lời ngắn (Điền kết quả số ngắn gọn vào shortAnswer).
+      + PHẦN IV: Tự luận (nếu đề gốc có phần tự luận).\n`;
+  }
+  result += `=================================================================\n\n`;
+
+  (originalExam.parts || []).forEach((part: any, pIdx: number) => {
+    const partTitle = part.partTitle || `PHẦN ${pIdx + 1}`;
+    result += `\n=================================================================\n`;
+    result += `[MỤC ${pIdx + 1}] ${partTitle}\n`;
+    if (part.instruction) result += `Chỉ dẫn: ${part.instruction}\n`;
+    result += `=================================================================\n`;
+
+    (part.questions || []).forEach((q: any) => {
+      const qNum = q.questionNumber;
+      const qType = (q.subQuestions && q.subQuestions.length > 0)
+        ? 'Trắc nghiệm Đúng/Sai (4 ý a, b, c, d)'
+        : (q.shortAnswer !== undefined && q.shortAnswer !== null && String(q.shortAnswer).trim() !== '')
+        ? 'Trắc nghiệm Trả lời ngắn (Điền kết quả số)'
+        : (q.options && q.options.length > 0)
+        ? 'Trắc nghiệm nhiều phương án (4 lựa chọn A, B, C, D)'
+        : 'Tự luận';
+
+      result += `\n--- [CÂU GỐC ${qNum}] ---\n`;
+      result += `• Dạng câu: ${qType}\n`;
+      result += `• Mức độ nhận thức: ${q.cognitiveLevel || 'Thông hiểu'}\n`;
+      if (q.topic) result += `• Chủ đề kiến thức: ${q.topic}\n`;
+      if (q.points) result += `• Thang điểm: ${q.points} điểm\n`;
+      result += `• Nội dung câu gốc: ${q.content || ''}\n`;
+
+      if (q.options && q.options.length > 0) {
+        result += `• Phương án gốc:\n`;
+        q.options.forEach((opt: any) => {
+          result += `    ${opt.key}. ${opt.content}\n`;
+        });
+        if (q.correctAnswer) result += `• Đáp án đúng gốc: ${q.correctAnswer}\n`;
+      }
+
+      if (q.subQuestions && q.subQuestions.length > 0) {
+        result += `• Các ý Đúng/Sai gốc:\n`;
+        q.subQuestions.forEach((sq: any) => {
+          result += `    ${sq.key}) ${sq.content} -> [${sq.isCorrect ? 'Đúng' : 'Sai'}]\n`;
+        });
+      }
+
+      if (q.shortAnswer) {
+        result += `• Kết quả trả lời ngắn gốc: ${q.shortAnswer}\n`;
+      }
+
+      const hasGeom = q.hasVisual || !!q.svgCode || !!q.visualDescription;
+      if (hasGeom) {
+        result += `• Yếu tố Hình học / Đồ thị gốc: ${q.visualDescription || 'Có hình vẽ minh họa'}\n`;
+      }
+
+      result += `>>> YÊU CẦU ĐỐI ỨNG 1-1 BẮT BUỘC CHO [CÂU MỚI ${qNum}]:\n`;
+      result += `    - Thứ tự: BẮT BUỘC là Câu ${qNum} thuộc ${partTitle}.\n`;
+      result += `    - Chủ đề & Dạng toán: BẮT BUỘC bám sát dạng toán và chủ đề của Câu gốc ${qNum}, cùng mức độ nhận thức (${q.cognitiveLevel || 'Thông hiểu'}).\n`;
+      result += `    - Định dạng câu hỏi: Phải đúng định dạng ${qType} của đề mẫu.\n`;
+
+      if (qType === 'Tự luận' || structureType === 'dang_1_tu_luan') {
+        result += `    - Yêu cầu tự luận: Biên soạn bài toán tự luận mới, chia các ý a), b), c) nếu có, kèm thang điểm và lời giải tự luận chi tiết từng bước bằng LaTeX.\n`;
+      } else if (q.subQuestions && q.subQuestions.length > 0) {
+        result += `    - Cấu trúc subQuestions: BẮT BUỘC sinh đủ 4 ý con a, b, c, d tương ứng với 4 ý gốc, mỗi ý có boolean isCorrect chuẩn xác.\n`;
+      } else if (q.shortAnswer) {
+        result += `    - Cấu trúc shortAnswer: BẮT BUỘC sinh câu hỏi có đáp án trả lời ngắn (số nguyên, số thập phân hoặc phân số tối giản) và điền vào shortAnswer.\n`;
+      } else {
+        result += `    - Cấu trúc 4 phương án: BẮT BUỘC sinh đủ 4 phương án A, B, C, D (1 đúng, 3 nhiễu hợp lý).\n`;
+      }
+
+      if (hasGeom) {
+        result += `    - QUY TẮC ĐỔI HÌNH HỌC BẮT BUỘC: Đổi sang LOẠI HÌNH KHÁC LOẠI (ví dụ: Chóp tứ giác -> Lăng trụ tam giác/Tứ diện; Trụ -> Nón/Cầu; Đồ thị bậc 3 -> Trùng phương/Phân thức), đổi toàn bộ thông số kích thước/tọa độ, vẽ mã svgCode mới chuẩn đẹp và đặt hasVisual: true.\n`;
+      } else {
+        result += `    - Đổi toàn bộ số liệu/hệ số, tính toán nghiệm đẹp, có lời giải chi tiết và công thức chuẩn LaTeX $...$.\n`;
+      }
+    });
+  });
+
+  return result;
+}
+
+// API: OCR and Analyze Exam Input - QUÉT TOÀN BỘ 100% NỘI DUNG VÀ NHẬN DIỆN 3 DẠNG ĐỀ
 app.post(['/api/exam/analyze', '/exam/analyze'], requireAuth, async (req: Request, res: Response) => {
   try {
-    const { images, textContent, subject, grade, examType, timeAllowed, notes } = req.body || {};
+    const { images, textContent, subject, grade, examType, timeAllowed, notes, targetStructureType } = req.body || {};
 
     if ((!images || images.length === 0) && (!textContent || textContent.trim() === '')) {
       return res.status(400).json({ error: 'Vui lòng tải lên ảnh, dán ảnh Ctrl+V hoặc chọn file PDF/Word.' });
     }
 
     const systemInstruction = `Bạn là Chuyên gia Giáo dục & Đánh giá Khảo thí AI cấp cao kiêm Chuyên viên xử lý dữ liệu tài liệu (OCR & Content Synthesis) của Bộ Giáo dục và Đào tạo Việt Nam.
-Nhiệm vụ tối quan trọng: Tiếp nhận tài liệu đề thi mẫu do người dùng cung cấp (ảnh chụp nhiều trang, file PDF hoặc file Word) và THỰC HIỆN QUÉT ĐẦY ĐỦ 100% TOÀN BỘ TẤT CẢ CÁC CÂU HỎI TRONG ĐỀ THI TỪ ĐẦU ĐẾN CUỐI.
+Nhiệm vụ tối quan trọng: Tiếp nhận tài liệu đề thi mẫu do người dùng cung cấp và:
+1. THỰC HIỆN QUÉT ĐẦY ĐỦ 100% TOÀN BỘ TẤT CẢ CÁC CÂU HỎI TRONG ĐỀ THI TỪ ĐẦU ĐẾN CUỐI (từ Câu 1 đến câu cuối cùng).
+2. NHẬN DIỆN CHÍNH XÁC CẤU TRÚC ĐỀ THI THUỘC 1 TRONG 3 DẠNG SAU ĐÂY:
+   - DẠNG 1: "dang_1_tu_luan" - Đề 100% Tự luận (Đề thi chỉ gồm các bài toán/câu hỏi tự luận, không có các phương án lựa chọn A, B, C, D).
+   - DẠNG 2: "dang_2_trac_nghiem_tu_luan" - Đề kết hợp 2 phần (Gồm 2 phần rõ rệt: Phần I Trắc nghiệm 4 lựa chọn A, B, C, D và Phần II Tự luận).
+   - DẠNG 3: "dang_3_chuan_bo_4_dang" - Đề chuẩn 4 dạng của Bộ GD&ĐT (Gồm: Trắc nghiệm 4 lựa chọn, Trắc nghiệm Đúng/Sai 4 ý con a, b, c, d, Trắc nghiệm trả lời ngắn điền số, và Tự luận nếu có).
 
-QUY TẮC BẮT BUỘC VỀ PHẠM VI QUÉT 100% (KHÔNG ĐƯỢC BỎ SÓT):
+QUY TẮC BẮT BUỘC VỀ PHẠM VI QUÉT 100%:
 1. QUÉT ĐỦ 100% TẤT CẢ CÁC CÂU HỎI:
-   - Bạn PHẢI quét đọc và trích xuất TOÀN BỘ tất cả các câu hỏi có trong tài liệu, từ Câu 1 cho đến câu cuối cùng của đề thi (ví dụ: đến hết Câu 40, Câu 50,...).
-   - TUYỆT ĐỐI KHÔNG ĐƯỢC rút gọn, KHÔNG được cắt ngắn, KHÔNG được dừng ở giữa chừng, KHÔNG được viết '...tương tự các câu tiếp theo'.
-   - Nếu đề thi có nhiều trang (Trang 1, Trang 2, Trang 3, Trang 4...), bạn PHẢI duyệt qua từng trang một, quét hết từng câu hỏi trên từng trang.
+   - Bạn PHẢI duyệt qua tất cả các trang, quét hết từng câu hỏi từ Câu 1 đến câu cuối cùng của đề. Tuyệt đối không cắt ngắn hay bỏ sót.
    - Thống kê chính xác tổng số câu hỏi đã quét được vào trường "totalQuestions".
 
-2. BẢO TOÀN NGUYÊN VẸN CẤU TRÚC VÀ CÁC MỤC I, II, III, IV:
-   - BẮT BUỘC giữ nguyên tiêu đề các mục / phần: PHẦN I, PHẦN II, PHẦN III, PHẦN IV (hoặc Mục I, II, III, IV) đúng như trong đề mẫu gốc.
-   - Các câu hỏi phải đánh số đúng thứ tự: Câu 1, Câu 2, Câu 3... giữ nguyên 100%.
-   - Định dạng theo chuẩn Bộ GD&ĐT:
+2. BẢO TOÀN NGUYÊN VẸN CẤU TRÚC VÀ CÁC MỤC/PHẦN THEO ĐÚNG DẠNG ĐỀ ĐÃ NHẬN DIỆN:
+   - Nếu là Dạng 1 (100% Tự luận): Giữ nguyên tiêu đề: "BÀI THI TỰ LUẬN" hoặc "PHẦN TỰ LUẬN" (hoặc từng Bài 1, Bài 2...). Mỗi câu có nội dung bài toán, các ý a), b), c), thang điểm (points) và lời giải tự luận chi tiết. KHÔNG tạo phương án A, B, C, D. Đánh dấu isEssay: true.
+   - Nếu là Dạng 2 (Trắc nghiệm & Tự luận): Giữ đúng 2 phần:
+     + PHẦN I: Trắc nghiệm khách quan (options: [{key: 'A', content: '...'}, ...], correctAnswer: '...').
+     + PHẦN II: Tự luận (các bài toán giải tự luận, isEssay: true).
+   - Nếu là Dạng 3 (Chuẩn Bộ GD&ĐT 4 dạng):
      + PHẦN I: Trắc nghiệm nhiều phương án (4 lựa chọn A, B, C, D).
-     + PHẦN II: Trắc nghiệm Đúng/Sai (Mỗi câu gồm 4 ý a, b, c, d rõ ràng với boolean isCorrect trong subQuestions).
-     + PHẦN III: Trắc nghiệm trả lời ngắn (Kết quả điền số).
+     + PHẦN II: Trắc nghiệm Đúng/Sai (Mỗi câu gồm 4 ý a, b, c, d với boolean isCorrect trong subQuestions).
+     + PHẦN III: Trắc nghiệm trả lời ngắn (Kết quả điền số vào shortAnswer).
      + PHẦN IV: Tự luận (nếu có).
 
-3. QUY TẮC CÔNG THỨC TOÁN HỌC & KHOA HỌC:
-   - MỌI công thức toán, lý, hóa BẮT BUỘC đặt trong cặp dấu chuẩn LaTeX: $công_thức$ (inline) hoặc $$công_thức$$ (display).
-   - Tuyệt đối không dùng ký tự Unicode thô sơ cho căn thức hay phân số (Dùng $\\frac{a}{b}$, $\\sqrt{x}$, $\\vec{u}$, $\\int$, $\\lim_{x \\to 0}$).
+3. XÁC ĐỊNH CHỦ ĐỀ & MỨC ĐỘ NHẬN THỨC CHO TỪNG CÂU:
+   - "topic": Xác định chính xác chủ đề kiến thức và dạng toán cụ thể.
+   - "cognitiveLevel": Phân loại 1 trong 4 mức: "Nhận biết", "Thông hiểu", "Vận dụng", "Vận dụng cao".
 
-4. NHẬN DIỆN CÂU HỎI CÓ HÌNH VẼ / ĐỒ THỊ / HÌNH HỌC (QUAN TRỌNG):
-   - Khi quét đề thi mẫu, hãy nhận diện kỹ tất cả câu hỏi nào có hình vẽ minh họa (đồ thị hàm số, bảng biến thiên, hình chóp, lăng trụ, nón, trụ, cầu, tam giác, đường tròn, hệ trục tọa độ Oxy/Oxyz, sơ đồ thực tế):
-   - BẮT BUỘC đặt "hasVisual": true.
-   - "visualDescription": Mô tả chi tiết hình vẽ (dạng đồ thị, các điểm cực trị, giao điểm trục tọa độ, các đỉnh hình học, chiều cao, góc, kích thước...).
-   - Cung cấp mã SVG nếu có thể trong "svgCode" ('<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg" style="background:#ffffff">...</svg>').
+4. QUY TẮC CÔNG THỨC TOÁN HỌC & HÌNH VẼ SVG:
+   - MỌI công thức toán, lý, hóa BẮT BUỘC đặt trong cặp dấu chuẩn LaTeX: $công_thức$ (inline) hoặc $$công_thức$$ (display).
+   - Câu nào có hình vẽ (đồ thị, hình học không gian, khối đa diện, nón, trụ, cầu...): đặt hasVisual: true, mô tả trong visualDescription và cung cấp mã svgCode nếu có.
 
 5. ĐỊNH DẠNG ĐẦU RA JSON BẮT BUỘC:
 {
   "title": "Tên kỳ thi / Môn học / Lớp / Thời gian làm bài",
   "subject": "Môn học (Toán, Vật lí, Hóa học, Sinh học, v.v.)",
   "grade": "Khối lớp (Lớp 10, Lớp 11, Lớp 12, THPT Quốc Gia, v.v.)",
+  "examStructureType": "dang_1_tu_luan" | "dang_2_trac_nghiem_tu_luan" | "dang_3_chuan_bo_4_dang",
+  "examStructureLabel": "Dạng 1: Đề 100% Tự luận" | "Dạng 2: Đề kết hợp 2 phần (Trắc nghiệm & Tự luận)" | "Dạng 3: Đề chuẩn 4 dạng (Trắc nghiệm, Đúng/Sai, Trả lời ngắn, Tự luận)",
   "totalQuestions": 40,
   "matrixSummary": {
     "topics": ["Chủ đề 1", "Chủ đề 2"],
@@ -565,22 +735,24 @@ QUY TẮC BẮT BUỘC VỀ PHẠM VI QUÉT 100% (KHÔNG ĐƯỢC BỎ SÓT):
       "vanDung": 20,
       "vanDungCao": 10
     },
-    "formats": ["Trắc nghiệm 4 lựa chọn", "Đúng/Sai", "Trả lời ngắn"]
+    "formats": ["Tự luận", "Trắc nghiệm 4 lựa chọn", "Đúng/Sai", "Trả lời ngắn"]
   },
   "parts": [
     {
       "partId": "part_1",
-      "partTitle": "PHẦN I. CÂU TRẮC NGHIỆM NHIỀU PHƯƠNG ÁN LỰA CHỌN",
-      "instruction": "Thí sinh trả lời từ câu 1 đến câu ... Mỗi câu hỏi thí sinh chỉ chọn một phương án.",
+      "partTitle": "Tên phần tương ứng theo đúng dạng đề",
+      "instruction": "Chỉ dẫn làm bài của phần này",
       "questions": [
         {
           "questionNumber": 1,
-          "content": "Nội dung câu hỏi 1 với công thức LaTeX $...$",
+          "content": "Nội dung câu hỏi $...$",
           "cognitiveLevel": "Nhận biết",
-          "topic": "Chủ đề",
+          "topic": "Chủ đề cụ thể",
           "hasVisual": false,
-          "visualDescription": "Mô tả hình nếu có",
-          "svgCode": "<svg ...>...</svg>",
+          "visualDescription": "",
+          "svgCode": "",
+          "isEssay": false,
+          "points": 1.0,
           "options": [
             { "key": "A", "content": "..." },
             { "key": "B", "content": "..." },
@@ -588,12 +760,12 @@ QUY TẮC BẮT BUỘC VỀ PHẠM VI QUÉT 100% (KHÔNG ĐƯỢC BỎ SÓT):
             { "key": "D", "content": "..." }
           ],
           "correctAnswer": "A",
-          "explanation": "Lời giải chi tiết ngắn gọn"
+          "explanation": "Lời giải chi tiết bằng LaTeX"
         }
       ]
     }
   ],
-  "rawOcrNotes": "Đã quét thành công 100% toàn bộ câu hỏi của đề thi"
+  "rawOcrNotes": "Đã quét thành công 100% toàn bộ câu hỏi và nhận diện chính xác dạng đề"
 }`;
 
     const promptParts: any[] = [];
@@ -612,11 +784,17 @@ QUY TẮC BẮT BUỘC VỀ PHẠM VI QUÉT 100% (KHÔNG ĐƯỢC BỎ SÓT):
     }
 
     let userPrompt = `YÊU CẦU QUAN TRỌNG: Hãy thực hiện quét OCR TOÀN DIỆN 100% TẤT CẢ các câu hỏi trong đề thi này, từ Câu 1 đến câu cuối cùng của đề.
+ĐẶC BIỆT: Hãy nhận diện chính xác đề thuộc dạng nào trong 3 dạng sau:
+1. Dạng 1: Đề 100% Tự luận (chỉ có các bài toán tự luận, không có lựa chọn A, B, C, D)
+2. Dạng 2: Đề kết hợp 2 phần (Phần I Trắc nghiệm 4 lựa chọn và Phần II Tự luận)
+3. Dạng 3: Đề chuẩn 4 dạng (Trắc nghiệm 4 lựa chọn, TN Đúng/Sai 4 ý, TN Trả lời ngắn, Tự luận)
+
 Thông tin giáo viên:
 - Môn: ${subject || 'Tự nhận diện'}
 - Khối: ${grade || 'Lớp 12'} (từ Lớp 1 đến Lớp 12)
 - Hình thức thi: ${examType || 'Giữa kì'}
 - Thời gian làm bài: ${timeAllowed || '90 phút'}
+- Gợi ý định dạng mong muốn: ${targetStructureType || 'Tự động nhận diện theo đề mẫu'}
 - Ghi chú: ${notes || 'Không có'}
 `;
 
@@ -625,8 +803,8 @@ Thông tin giáo viên:
     }
 
     userPrompt += `\nLƯU Ý ĐẶC BIỆT:
-1. Hãy quét ĐỦ 100% TẤT CẢ các câu hỏi có trong tài liệu, TUYỆT ĐỐI KHÔNG BỎ SÓT câu nào từ đầu đến cuối.
-2. Bảo toàn các mục: PHẦN I, PHẦN II, PHẦN III, PHẦN IV và số thứ tự Câu 1, Câu 2...
+1. Quét ĐỦ 100% TẤT CẢ các câu hỏi có trong tài liệu, TUYỆT ĐỐI KHÔNG BỎ SÓT câu nào từ đầu đến cuối.
+2. Nhận diện chuẩn xác 1 trong 3 dạng: "dang_1_tu_luan", "dang_2_trac_nghiem_tu_luan" hoặc "dang_3_chuan_bo_4_dang".
 3. Xuất toàn bộ công thức toán bằng LaTeX $...$ chuẩn. Trả về đúng định dạng JSON quy định.`;
 
     promptParts.push({ text: userPrompt });
@@ -658,6 +836,21 @@ Thông tin giáo viên:
     if (examType) parsedData.examType = examType;
     if (timeAllowed) parsedData.timeAllowed = timeAllowed;
 
+    // Chuẩn hóa và kiểm chứng chính xác 100% dạng đề
+    const detected = detectExamStructureType(parsedData);
+    if (targetStructureType && ['dang_1_tu_luan', 'dang_2_trac_nghiem_tu_luan', 'dang_3_chuan_bo_4_dang'].includes(targetStructureType)) {
+      parsedData.examStructureType = targetStructureType;
+      parsedData.examStructureLabel =
+        targetStructureType === 'dang_1_tu_luan'
+          ? 'Dạng 1: Đề 100% Tự luận'
+          : targetStructureType === 'dang_2_trac_nghiem_tu_luan'
+          ? 'Dạng 2: Đề kết hợp 2 phần (Trắc nghiệm & Tự luận)'
+          : 'Dạng 3: Đề chuẩn 4 dạng (Trắc nghiệm, Đúng/Sai, Trả lời ngắn, Tự luận)';
+    } else {
+      parsedData.examStructureType = parsedData.examStructureType || detected.type;
+      parsedData.examStructureLabel = parsedData.examStructureLabel || detected.label;
+    }
+
     const allQuestions = (parsedData.parts || []).flatMap((p: any) => p.questions || []);
     if (allQuestions.length > 0) {
       parsedData.totalQuestions = allQuestions.length;
@@ -667,6 +860,8 @@ Thông tin giáo viên:
       success: true,
       data: parsedData,
       totalQuestionsScanned: allQuestions.length,
+      examStructureType: parsedData.examStructureType,
+      examStructureLabel: parsedData.examStructureLabel,
     });
   } catch (error: any) {
     console.error('Error analyzing exam:', error);
@@ -677,7 +872,7 @@ Thông tin giáo viên:
   }
 });
 
-// API: Sinh đề tương đương - ĐẢM BẢO SINH ĐỦ 100% SỐ CÂU NHƯ ĐỀ GỐC
+// API: Sinh đề tương đương - BÁM SÁT 100% DẠNG ĐỀ ĐÃ NHẬN DIỆN (DẠNG 1, DẠNG 2 HOẶC DẠNG 3)
 app.post(['/api/exam/generate-equivalent', '/exam/generate-equivalent'], requireAuth, async (req: Request, res: Response) => {
   try {
     const { originalExam, variantIndex = 1, customization } = req.body || {};
@@ -689,44 +884,51 @@ app.post(['/api/exam/generate-equivalent', '/exam/generate-equivalent'], require
     const totalOriginalQuestions = (originalExam.parts || []).flatMap((p: any) => p.questions || []).length;
     const currentCodeNumber = 100 + Number(variantIndex);
 
+    // Nhận diện dạng đề của đề gốc
+    const detected = detectExamStructureType(originalExam);
+    const structureType = originalExam.examStructureType || detected.type;
+    const structureLabel = originalExam.examStructureLabel || detected.label;
+
+    // Chuyển đề gốc thành bảng Blueprint đặc tả 1-1 từng câu theo đúng dạng đề
+    const structuredBlueprint = formatOriginalExamForPrompt(originalExam);
+
     const systemInstruction = `Bạn là Chuyên gia Khảo thí & Biên soạn Đề thi Quốc gia cấp cao của Bộ Giáo dục & Đào tạo Việt Nam.
-Nhiệm vụ tối quan trọng: Biên soạn ĐỀ THI TƯƠNG ĐƯƠNG (MÃ ĐỀ: ${currentCodeNumber}) từ đề thi gốc được cung cấp, tuân thủ nguyên tắc khảo thí chuẩn mực.
+Nhiệm vụ tối thượng: Biên soạn ĐỀ THI TƯƠNG ĐƯƠNG (MÃ ĐỀ: ${currentCodeNumber}) BÁM SÁT 1-1 TUYỆT ĐỐI THEO TỪNG CÂU VÀ THEO ĐÚNG DẠNG ĐỀ CỦA ĐỀ THI MẪU:
+DẠNG ĐỀ: ${structureLabel} (Mã: ${structureType})
 
-NGUYÊN TẮC BẮT BUỘC 100%:
-1. BÁM SÁT 100% CẤU TRÚC ĐỀ MẪU (TƯƠNG ỨNG 1-1 TỪNG CÂU VỚI ĐỀ GỐC):
-   - Đề gốc có bao nhiêu phần (PHẦN I, PHẦN II, PHẦN III, PHẦN IV...) và mỗi phần có bao nhiêu câu, THÌ ĐỀ MỚI BẮT BUỘC PHẢI CÓ ĐÚNG SỐ PHẦN ĐÓ VÀ ĐÚNG SỐ LƯỢNG CÂU ĐÓ (tổng cộng đủ 100% ${totalOriginalQuestions} câu).
-   - TƯƠNG ỨNG 1-1 TỪNG CÂU VỚI ĐỀ MẪU:
-     + Câu 1 đề mẫu hỏi về dạng toán/chủ đề nào thì Câu 1 đề mới BẮT BUỘC hỏi về dạng toán/chủ đề đó với mức độ nhận thức tương đương.
-     + Nếu Câu k là trắc nghiệm 4 chọn 1: Đề mới câu k cũng là trắc nghiệm 4 chọn 1.
-     + Nếu Câu k là trắc nghiệm Đúng/Sai (gồm 4 ý a, b, c, d): Đề mới câu k BẮT BUỘC cũng là trắc nghiệm Đúng/Sai với 4 ý a, b, c, d tương ứng.
-     + Nếu Câu k là trả lời ngắn (điền số/đáp án): Đề mới câu k BẮT BUỘC cũng là câu hỏi trả lời ngắn.
-   - GIỮ NGUYÊN 100% TIÊU ĐỀ CÁC PHẦN (PHẦN I, PHẦN II, PHẦN III...) và số thứ tự Câu 1, Câu 2, Câu 3... y hệt đề gốc.
+NGUYÊN TẮC BẮT BUỘC 100% THEO TỪNG DẠNG ĐỀ:
+1. NẾU ĐỀ GỐC LÀ DẠNG 1 (ĐỀ 100% TỰ LUẬN):
+   - Đề mới BẮT BUỘC 100% LÀ CÁC CÂU TỰ LUẬN (Bài 1, Bài 2... hoặc Câu 1, Câu 2...).
+   - TUYỆT ĐỐI KHÔNG SINH BẤT KỲ CÂU TRẮC NGHIỆM A, B, C, D NÀO!
+   - Từng bài toán tự luận mới phải tương đương 1-1 với bài toán tự luận đề gốc (cùng chủ đề, cùng phương pháp giải, đổi tham số, nghiệm đẹp, kèm thang điểm points và hướng dẫn giải tự luận bài bản từng bước).
 
-2. QUY TẮC BẮT BUỘC VỀ YẾU TỐ HÌNH HỌC (BẮT BUỘC THAY ĐỔI THÀNH CÁC HÌNH KHÁC NHAU):
-   - ĐẶC BIỆT LƯU Ý VÀ TUÂN THỦ NGHIÊM NGẶT: Với MỌI câu hỏi có yếu tố hình học (hình học phẳng, hình học không gian, khối đa diện, khối tròn xoay, hệ tọa độ Oxy/Oxyz, đồ thị hàm số):
-     + BẮT BUỘC PHẢI THAY ĐỔI THÀNH CÁC LOẠI HÌNH KHÁC NHAU (TUYỆT ĐỐI KHÔNG DÙNG LẠI LOẠI HÌNH CŨ TRONG ĐỀ GỐC)!
-     + CÁC QUY TẮC CHUYỂN ĐỔI HÌNH CỤ THỂ:
-       * Nếu đề gốc là HÌNH CHÓP TỨ GIÁC (đáy hình vuông, hình chữ nhật) -> Đề mới BẮT BUỘC PHẢI ĐỔI THÀNH HÌNH LĂNG TRỤ TAM GIÁC, HÌNH LĂNG TRỤ ĐỨNG TỨ GIÁC, HÌNH HỘP CHỮ NHẬT, hoặc HÌNH CHÓP TAM GIÁC (TỨ DIỆN).
-       * Nếu đề gốc là HÌNH CHÓP TAM GIÁC (TỨ DIỆN) -> Đề mới BẮT BUỘC PHẢI ĐỔI THÀNH HÌNH LĂNG TRỤ TAM GIÁC ĐỨNG, HÌNH HỘP, hoặc HÌNH CHÓP CÓ ĐÁY HÌNH THOI / HÌNH CHỮ NHẬT.
-       * Nếu đề gốc là KHỐI LĂNG TRỤ -> Đề mới BẮT BUỘC PHẢI ĐỔI THÀNH HÌNH CHÓP, HÌNH HỘP, hoặc KHỐI NÓN/TRỤ tương ứng.
-       * Nếu đề gốc là KHỐI TRỤ -> Đề mới BẮT BUỘC PHẢI ĐỔI THÀNH KHỐI NÓN, hoặc KHỐI CẦU, hoặc LĂNG TRỤ ĐỀU NỘI TIẾP TRỤ.
-       * Nếu đề gốc là KHỐI NÓN -> Đề mới BẮT BUỘC PHẢI ĐỔI THÀNH KHỐI TRỤ hoặc KHỐI CẦU.
-       * Nếu đề gốc là TAM GIÁC VUÔNG -> Đề mới BẮT BUỘC PHẢI ĐỔI THÀNH TAM GIÁC ĐỀU, TAM GIÁC CÂN, HÌNH THANG VUÔNG hoặc HÌNH THOI.
-       * Nếu đề gốc là HÌNH VUÔNG / CHỮ NHẬT -> Đề mới BẮT BUỘC PHẢI ĐỔI THÀNH HÌNH BÌNH HÀNH, HÌNH THOI, hoặc HÌNH THANG CÂN.
-       * Nếu đề gốc là ĐỒ THỊ BẬC BA ($y = ax^3 + bx^2 + cx + d$) -> Đề mới BẮT BUỘC PHẢI ĐỔI THÀNH ĐỒ THỊ BẬC BỐN TRÙNG PHƯƠNG ($y = ax^4 + bx^2 + c$), hoặc ĐỒ THỊ HÀM PHÂN THỨC HỮU TỶ ($y = \\frac{ax+b}{cx+d}$), hoặc ĐỒ THỊ BẬC HAI TRÊN BẬC NHẤT ($y = \\frac{ax^2+bx+c}{dx+e}$).
-       * Nếu đề gốc là BẢNG BIẾN THIÊN -> Đề mới CÓ THỂ ĐỔI THÀNH ĐỒ THỊ TRỰC QUAN hoặc HÀM SỐ KHÁC VỚI CÁC ĐIỂM CỰC TRỊ VÀ BẢNG DẤU ĐẠO HÀM MỚI.
-       * Nếu đề gốc là PHƯƠNG TRÌNH MẶT CẦU TRONG OXYZ -> Đề mới BẮT BUỘC ĐỔI THÀNH PHƯƠNG TRÌNH MẶT PHẲNG, ĐƯỜNG THẲNG, hoặc TỨ DIỆN/HÌNH HỘP TRONG OXYZ.
-     + ĐỒNG THỜI THAY ĐỔI TOÀN BỘ SỐ LIỆU: Mọi kích thước cạnh, chiều cao, bán kính, số đo góc, tọa độ điểm và hệ số hàm số phải được tính toán mới hoàn toàn, cho kết quả nghiệm đẹp, phân số tối giản.
-     + HÌNH VẼ SVG ĐÍNH KÈM ("svgCode"): BẮT BUỘC PHẢI VẼ ĐÚNG THEO LOẠI HÌNH MỚI ĐÃ CHUYỂN ĐỔI (ví dụ: chuyển từ chóp sang lăng trụ thì hình SVG phải là hình lăng trụ với đầy đủ các đỉnh A, B, C, A', B', C' và nét đứt nét liền chuẩn xác)!
+2. NẾU ĐỀ GỐC LÀ DẠNG 2 (KẾT HỢP 2 PHẦN TRẮC NGHIỆM & TỰ LUẬN):
+   - Đề mới BẮT BUỘC GỒM ĐÚNG 2 PHẦN:
+     + PHẦN I: Trắc nghiệm 4 lựa chọn (A, B, C, D) - tương ứng 1-1 từng câu.
+     + PHẦN II: Tự luận - tương ứng 1-1 từng bài tự luận, có thang điểm và lời giải bài bản.
 
-3. QUY CHUẨN CÔNG THỨC TOÁN & HÌNH VẼ SVG:
-   - MỌI công thức toán học BẮT BUỘC đặt trong cặp dấu LaTeX: $công_thức$ (inline) hoặc $$công_thức$$ (display).
-   - Câu nào có hình vẽ (hoặc hasVisual: true ở đề gốc): Đặt "hasVisual": true và cung cấp mã SVG hoàn chỉnh, đẹp mắt trong "svgCode" ('<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg" style="background:#ffffff">...</svg>') vẽ đúng theo loại hình mới đã thay đổi.
-   - Nội dung câu hỏi ("content") bám sát hình vẽ tương ứng của câu đó.
+3. NẾU ĐỀ GỐC LÀ DẠNG 3 (CHUẨN BỘ GD&ĐT 4 DẠNG):
+   - Đề mới BẮT BUỘC GIỮ ĐÚNG CÁC PHẦN:
+     + PHẦN I: Trắc nghiệm nhiều phương án (4 lựa chọn A, B, C, D).
+     + PHẦN II: Trắc nghiệm Đúng/Sai (Mỗi câu gồm đúng 4 ý con a, b, c, d với boolean isCorrect).
+     + PHẦN III: Trắc nghiệm Trả lời ngắn (kết quả điền số vào shortAnswer).
+     + PHẦN IV: Tự luận (nếu đề gốc có phần tự luận).
 
-4. BẢNG ĐÁP ÁN & HƯỚNG DẪN CHẤM:
-   - Bảng đáp án nhanh đầy đủ cho tất cả ${totalOriginalQuestions} câu.
-   - Hướng dẫn giải chi tiết từng bước bằng LaTeX chuẩn mực.
+4. QUY TẮC BẮT BUỘC VỀ YẾU TỐ HÌNH HỌC (BẮT BUỘC THAY ĐỔI THÀNH CÁC HÌNH KHÁC NHAU):
+   - Với MỌI câu hỏi có yếu tố hình học (hình học phẳng, hình không gian, khối đa diện, khối tròn xoay, hệ tọa độ Oxyz, đồ thị hàm số):
+     + BẮT BUỘC ĐỔI SANG LOẠI HÌNH KHÁC NHAU:
+       * Chóp tứ giác -> Lăng trụ tam giác, tứ diện, hoặc lăng trụ đứng tứ giác.
+       * Chóp tam giác (tứ diện) -> Lăng trụ đứng tam giác hoặc hình hộp.
+       * Trụ -> Nón hoặc Cầu.
+       * Nón -> Trụ hoặc Cầu.
+       * Tam giác vuông -> Tam giác đều, tam giác cân hoặc hình thang vuông.
+       * Đồ thị bậc ba -> Bậc bốn trùng phương hoặc Phân thức hữu tỷ.
+     + Đổi mới toàn bộ số liệu kích thước, tọa độ, hệ số hàm số để ra nghiệm đẹp.
+     + Sinh mã SVG ("svgCode") vẽ đúng theo loại hình mới đã chuyển đổi và đặt "hasVisual": true.
+
+5. ĐÁP ÁN VÀ LỜI GIẢI CHI TIẾT:
+   - "quickAnswerKey": Cung cấp mảng đáp án nhanh. Với câu tự luận có thể ghi "Xem lời giải".
+   - "explanation": Hướng dẫn giải chi tiết bằng công thức LaTeX chuẩn mực.
 
 CẤU TRÚC JSON TRẢ VỀ:
 {
@@ -735,14 +937,16 @@ CẤU TRÚC JSON TRẢ VỀ:
   "subject": "${originalExam.subject || 'Toán'}",
   "grade": "${originalExam.grade || 'Lớp 12'}",
   "examType": "${originalExam.examType || 'Giữa kì'}",
+  "examStructureType": "${structureType}",
+  "examStructureLabel": "${structureLabel}",
   "timeAllowed": "${originalExam.timeAllowed || '90 phút'}",
   "totalScore": 10.0,
   "totalQuestions": ${totalOriginalQuestions},
   "parts": [
     {
       "partId": "part_1",
-      "partTitle": "PHẦN I. CÂU TRẮC NGHIỆM NHIỀU PHƯƠNG ÁN LỰA CHỌN",
-      "instruction": "Thí sinh trả lời từ câu 1 đến câu ... Mỗi câu hỏi thí sinh chỉ chọn một phương án.",
+      "partTitle": "Tên phần tương ứng",
+      "instruction": "Chỉ dẫn làm bài",
       "questions": [
         {
           "questionNumber": 1,
@@ -752,6 +956,8 @@ CẤU TRÚC JSON TRẢ VỀ:
           "hasVisual": false,
           "visualDescription": "",
           "svgCode": "",
+          "isEssay": false,
+          "points": 1.0,
           "options": [
             { "key": "A", "content": "$...$" },
             { "key": "B", "content": "$...$" },
@@ -767,45 +973,24 @@ CẤU TRÚC JSON TRẢ VỀ:
   "quickAnswerKey": [
     { "question": 1, "answer": "A" }
   ],
-  "pedagogicalNotes": "Đề tương đương được biên soạn chuẩn mực 100% số câu, chuyển đổi hình học đa dạng và bám sát ma trận đề gốc."
+  "pedagogicalNotes": "Đề tương đương được biên soạn chuẩn mực 100% bám sát dạng đề ${structureLabel}."
 }`;
 
-    const promptExamData = {
-      title: originalExam.title,
-      subject: originalExam.subject,
-      grade: originalExam.grade,
-      examType: originalExam.examType,
-      timeAllowed: originalExam.timeAllowed,
-      totalQuestions: totalOriginalQuestions,
-      parts: (originalExam.parts || []).map((p: any) => ({
-        partId: p.partId,
-        partTitle: p.partTitle,
-        instruction: p.instruction,
-        questions: (p.questions || []).map((q: any) => ({
-          questionNumber: q.questionNumber,
-          content: q.content,
-          cognitiveLevel: q.cognitiveLevel,
-          topic: q.topic,
-          hasVisual: q.hasVisual,
-          visualDescription: q.visualDescription || (q.svgCode ? 'Có hình minh họa' : undefined),
-          options: q.options,
-          subQuestions: q.subQuestions,
-          shortAnswer: q.shortAnswer,
-          correctAnswer: q.correctAnswer,
-          explanation: q.explanation,
-        })),
-      })),
-    };
+    const userPrompt = `Hãy biên soạn ĐỀ THI TƯƠNG ĐƯƠNG (MÃ ĐỀ: ${currentCodeNumber}) BÁM SÁT 1-1 TUYỆT ĐỐI THEO DẠNG ĐỀ [${structureLabel}] của ${totalOriginalQuestions} câu hỏi từ đề gốc sau:
 
-    const userPrompt = `Hãy biên soạn ĐỀ THI TƯƠNG ĐƯƠNG (MÃ ĐỀ: ${currentCodeNumber}) bám sát 100% cấu trúc của ${totalOriginalQuestions} câu hỏi từ đề gốc sau đây:
-${JSON.stringify(promptExamData, null, 2)}
+${structuredBlueprint}
 
-Yêu cầu bắt buộc:
-1. Bám sát 100% cấu trúc đề mẫu (đặc biệt các phần I, II, III... và từng câu tương ứng 1-1 từ Câu 1 đến Câu ${totalOriginalQuestions}). Đủ 100% số câu, không bỏ sót câu nào.
-2. CÁC CÂU CÓ YẾU TỐ HÌNH HỌC (BẮT BUỘC THAY ĐỔI THÀNH CÁC HÌNH KHÁC NHAU): Mọi câu hỏi hình học (hình học phẳng, hình không gian, khối đa diện, khối tròn xoay, tọa độ Oxyz, đồ thị hàm số) BẮT BUỘC PHẢI THAY ĐỔI THÀNH LOẠI HÌNH KHÁC (chóp tứ giác đổi sang lăng trụ tam giác hoặc tứ diện; trụ đổi sang nón hoặc cầu; tam giác vuông đổi sang tam giác đều hoặc hình thang vuông; đồ thị bậc ba đổi sang đồ thị phân thức hoặc bậc bốn trùng phương). Tuyệt đối không giữ nguyên cùng loại hình và không giữ nguyên số liệu đề gốc!
-3. VẼ HÌNH SVG TƯƠNG ỨNG VỚI HÌNH MỚI: Sinh mã "svgCode" chuẩn xác vẽ đúng theo loại hình mới đã chuyển đổi (đầy đủ các đỉnh, nét đứt nét liền, nhãn chuẩn xác) và đặt "hasVisual": true.
+YÊU CẦU BẮT BUỘC CAO NHẤT:
+1. BÁM SÁT 100% DẠNG ĐỀ ĐÃ NHẬN DIỆN:
+   ${structureType === 'dang_1_tu_luan'
+     ? '- ĐÂY LÀ ĐỀ 100% TỰ LUẬN: Đề mới BẮT BUỘC sinh 100% là các bài toán tự luận, TUYỆT ĐỐI KHÔNG sinh trắc nghiệm A, B, C, D! Mỗi câu tự luận có lời giải bài bản từng bước.'
+     : structureType === 'dang_2_trac_nghiem_tu_luan'
+     ? '- ĐÂY LÀ ĐỀ GỒM 2 PHẦN TRẮC NGHIỆM VÀ TỰ LUẬN: Giữ đúng 2 phần: Phần I Trắc nghiệm 4 lựa chọn và Phần II Tự luận.'
+     : '- ĐÂY LÀ ĐỀ CHUẨN 4 DẠNG BỘ GD&ĐT: Giữ đúng các phần: Trắc nghiệm 4 chọn 1, Đúng/Sai 4 ý có subQuestions, Trả lời ngắn có shortAnswer, Tự luận nếu có.'}
+2. ĐỐI ỨNG 1-1 TỪNG CÂU: Duyệt từ Câu 1 đến Câu ${totalOriginalQuestions}, mỗi câu mới cùng dạng toán, cùng chủ đề, cùng mức độ nhận thức.
+3. CÁC CÂU CÓ HÌNH HỌC: BẮT BUỘC chuyển sang loại hình khác theo quy định (chóp -> lăng trụ/tứ diện; trụ -> nón/cầu; bậc 3 -> trùng phương/phân thức; ...), đổi số liệu và vẽ svgCode tương ứng.
 4. MÃ ĐỀ: Đặt đúng là "MÃ ĐỀ: ${currentCodeNumber}".
-5. Đáp án chính xác, lời giải chi tiết bằng LaTeX.`;
+5. Trả về định dạng JSON thuần túy theo mẫu quy định.`;
 
     const response = await callGeminiFast({
       model: FAST_MODEL,
@@ -813,8 +998,8 @@ Yêu cầu bắt buộc:
       config: {
         systemInstruction,
         responseMimeType: 'application/json',
-        temperature: 0.15,
-        topP: 0.85,
+        temperature: 0.1,
+        topP: 0.8,
         maxOutputTokens: 65536,
       },
     });
@@ -837,6 +1022,8 @@ Yêu cầu bắt buộc:
     parsedData.grade = originalExam.grade;
     parsedData.examType = originalExam.examType || 'Giữa kì';
     parsedData.timeAllowed = originalExam.timeAllowed || '90 phút';
+    parsedData.examStructureType = structureType;
+    parsedData.examStructureLabel = structureLabel;
 
     res.json({
       success: true,
