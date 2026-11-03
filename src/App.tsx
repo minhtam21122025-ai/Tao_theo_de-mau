@@ -24,9 +24,19 @@ import {
   Download,
   Layers,
   XCircle,
+  AlertCircle,
+  RefreshCw,
 } from 'lucide-react';
 
 export default function App() {
+  // Trạng thái thông báo kết nối hệ thống
+  const [systemBanner, setSystemBanner] = useState<{
+    type: 'error' | 'warning';
+    title: string;
+    message: string;
+  } | null>(null);
+  const [isRetryingConnection, setIsRetryingConnection] = useState<boolean>(false);
+
   // Trạng thái đề thi
   const [originalExam, setOriginalExam] = useState<ExamData | null>(null);
   const [equivalentExams, setEquivalentExams] = useState<ExamData[]>([]);
@@ -43,6 +53,32 @@ export default function App() {
   const isCancelledRef = useRef<boolean>(false);
 
   const currentEquivalent = equivalentExams[selectedVariantIndex] || null;
+
+  // Kiểm tra kết nối dịch vụ ngầm khi khởi động ứng dụng
+  const checkServiceHealth = async (showNoticeOnFailure = false) => {
+    try {
+      setIsRetryingConnection(true);
+      const res = await fetch('/api/health');
+      if (res.ok) {
+        setSystemBanner(null);
+      } else if (res.status === 404 && showNoticeOnFailure) {
+        setSystemBanner({
+          type: 'error',
+          title: 'Thông báo trạng thái hệ thống',
+          message:
+            'Đường dẫn dịch vụ không tìm thấy hoặc đã thay đổi (Mã lỗi 404). Hệ thống đang kiểm tra lại kết nối.',
+        });
+      }
+    } catch {
+      // Mạng tạm thời chưa sẵn sàng
+    } finally {
+      setIsRetryingConnection(false);
+    }
+  };
+
+  useEffect(() => {
+    checkServiceHealth(false);
+  }, []);
 
   // Lắng nghe phím tắt Ctrl + V toàn cục khi chưa có đề để tự mở modal và dán ảnh
   useEffect(() => {
@@ -291,6 +327,39 @@ export default function App() {
         onResetExam={handleClearCurrentExam}
         onCancelGenerate={handleCancelGeneration}
       />
+
+      {/* Thông báo trạng thái hệ thống (tự động khôi phục hoặc cho phép đóng/thử lại) */}
+      {systemBanner && (
+        <div className="bg-rose-50 border-b border-rose-200 text-rose-900 px-4 py-3 shadow-2xs no-print transition-all">
+          <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="h-5 w-5 text-rose-600 shrink-0 mt-0.5 sm:mt-0" />
+              <div>
+                <h4 className="text-xs font-bold text-rose-900">{systemBanner.title}</h4>
+                <p className="text-xs text-rose-700 mt-0.5">{systemBanner.message}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+              <button
+                type="button"
+                onClick={() => checkServiceHealth(true)}
+                disabled={isRetryingConnection}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-800 hover:bg-rose-100 transition-colors"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${isRetryingConnection ? 'animate-spin' : ''}`} />
+                <span>Thử lại</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSystemBanner(null)}
+                className="rounded-lg bg-rose-200/70 hover:bg-rose-200 px-3 py-1 text-xs font-semibold text-rose-900 transition-colors"
+              >
+                Đóng
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Thông báo tiến trình sinh hàng loạt kèm NÚT HỦY TẠO ĐỀ NỔI BẬT */}
       {isBatchGenerating && (

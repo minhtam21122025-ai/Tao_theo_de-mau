@@ -96,13 +96,19 @@ function getAiInstance(): GoogleGenAI {
   });
 }
 
-// Danh sách các mô hình tối ưu theo thứ tự ưu tiên & dự phòng khi hết hạn mức (Quota 429)
-const FAST_MODEL = 'gemini-2.5-flash';
-const CANDIDATE_MODELS = [
+// Danh sách các mô hình tối ưu theo tài liệu kỹ thuật chuẩn, hỗ trợ dự phòng đa cấp:
+// 1. 'gemini-2.5-flash': Mô hình chính - tốc độ cực nhanh, bóc tách LaTeX và cấu trúc JSON chuẩn xác
+// 2. 'gemini-3.8-flash': Mô hình tư duy khảo thí chuyên sâu - thế hệ mới nhất cho môn Toán & STEM
+// 3. 'gemini-3.1-flash-lite': Mô hình Flash Lite thông lượng lớn, hạn mức RPM/TPM cao, dự phòng khi nghẽn tải
+// 4. 'gemini-flash-latest': Alias chính thức từ Google trỏ đến phiên bản Flash ổn định nhất
+export const PRIMARY_MODEL = 'gemini-2.5-flash';
+export const CANDIDATE_MODELS = [
   'gemini-2.5-flash',
-  'gemini-3.1-flash-lite',
   'gemini-3.8-flash',
+  'gemini-3.1-flash-lite',
+  'gemini-flash-latest',
 ];
+const FAST_MODEL = PRIMARY_MODEL;
 
 // Helper: Repair unescaped LaTeX backslashes and raw control characters inside JSON strings
 function repairJsonWithLatex(jsonStr: string): string {
@@ -258,59 +264,166 @@ function safeParseJSON(rawStr: string, fallback: any = {}): any {
   }
 }
 
+/**
+ * Động cơ gọi Gemini thông minh và chống lỗi toàn diện (Resilient Multi-Model Engine):
+ * - Xử lý mã 404 (Not Found / Model Unavailable): Không kẹt lại, tự động chuyển ngay sang mô hình dự phòng tiếp theo.
+ * - Xử lý mã 429 (Resource Exhausted / Rate Limit): Tự động chờ Backoff + Jitter và chuyển sang mô hình có Quota riêng biệt.
+ * - Xử lý mã 500 / 502 / 503 / 504 (Server Overloaded / Unavailable): Tự động thử lại với độ trễ tăng dần, sau đó chuyển vùng mô hình.
+ */
 async function callGeminiFast(params: {
   model?: string;
   contents: any;
   config?: any;
 }): Promise<any> {
   const ai = getAiInstance();
-  const preferredModel = params.model || FAST_MODEL;
+  const requestedModel = params.model || PRIMARY_MODEL;
+
+  // Xếp hàng các mô hình: mô hình yêu cầu đứng trước, sau đó là các mô hình dự phòng
   const queue = [
-    preferredModel,
-    ...CANDIDATE_MODELS.filter((m) => m !== preferredModel),
+    requestedModel,
+    ...CANDIDATE_MODELS.filter((m) => m !== requestedModel),
   ];
 
   let lastError: any = null;
+  const attemptsLog: string[] = [];
 
-  for (let i = 0; i < queue.length; i++) {
-    const model = queue[i];
-    try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: params.contents,
-        config: params.config,
-      });
-      return response;
-    } catch (err: any) {
-      lastError = err;
-      const isQuota =
-        err?.status === 'RESOURCE_EXHAUSTED' ||
-        err?.message?.includes('429') ||
-        err?.message?.includes('Quota exceeded');
+  for (let modelIndex = 0; modelIndex < queue.length; modelIndex++) {
+    const currentModel = queue[modelIndex];
+    const maxRetriesThisModel = 2; // Tối đa 2 lần thử lại cho mỗi mô hình nếu gặp lỗi tạm thời (429, 500, 503)
 
-      console.warn(
-        `[Gemini Engine] Mô hình "${model}" thất bại (hết quota: ${isQuota}): ${err?.message?.slice(0, 150)}`
-      );
+    for (let attempt = 0; attempt <= maxRetriesThisModel; attempt++) {
+      try {
+        console.log(
+          `[Gemini Engine] Gọi mô hình "${currentModel}" (Lần thử ${attempt + 1}/${maxRetriesThisModel + 1})...`
+        );
 
-      if (i < queue.length - 1) {
-        console.log(`[Gemini Engine] Tự động chuyển tiếp sang mô hình dự phòng "${queue[i + 1]}"...`);
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        // Chuẩn hóa cấu hình: loại bỏ các tham số quá giới hạn có thể gây lỗi 400/500
+        const safeConfig = { ...(params.config || {}) };
+        if (safeConfig.maxOutputTokens && safeConfig.maxOutputTokens > 32768 && currentModel.includes('lite')) {
+          safeConfig.maxOutputTokens = 16384;
+        }
+
+        const response = await ai.models.generateContent({
+          model: currentModel,
+          contents: params.contents,
+          config: safeConfig,
+        });
+
+        if (response && (response.text !== undefined || (response.candidates && response.candidates.length > 0))) {
+          console.log(`[Gemini Engine] Gọi thành công mô hình "${currentModel}".`);
+          return response;
+        }
+
+        throw new Error(`Mô hình ${currentModel} phản hồi không có nội dung văn bản.`);
+      } catch (err: any) {
+        lastError = err;
+        const errMsg = String(err?.message || err || '');
+        const status = err?.status || (err?.response ? err.response.status : undefined);
+
+        const isNotFound404 =
+          status === 404 ||
+          errMsg.includes('404') ||
+          errMsg.includes('NOT_FOUND') ||
+          errMsg.includes('not found') ||
+          errMsg.includes('is not supported') ||
+          errMsg.includes('not supported for this API version');
+
+        const isQuota429 =
+          status === 429 ||
+          status === 'RESOURCE_EXHAUSTED' ||
+          errMsg.includes('429') ||
+          errMsg.includes('RESOURCE_EXHAUSTED') ||
+          errMsg.includes('Quota exceeded') ||
+          errMsg.includes('Too Many Requests');
+
+        const isServerOverload500_503 =
+          status === 500 ||
+          status === 502 ||
+          status === 503 ||
+          status === 504 ||
+          status === 'UNAVAILABLE' ||
+          status === 'INTERNAL' ||
+          errMsg.includes('500') ||
+          errMsg.includes('502') ||
+          errMsg.includes('503') ||
+          errMsg.includes('504') ||
+          errMsg.includes('UNAVAILABLE') ||
+          errMsg.includes('INTERNAL') ||
+          errMsg.includes('overloaded');
+
+        const logEntry = `[${currentModel} lần ${attempt + 1}] Mã: ${status || 'ERR'} - ${errMsg.slice(0, 100)}`;
+        attemptsLog.push(logEntry);
+        console.warn(`[Gemini Engine Cảnh báo] ${logEntry}`);
+
+        // 1. Trường hợp Lỗi 404 (Mô hình không tồn tại / không hỗ trợ phiên bản này):
+        // KHÔNG thử lại mô hình này, lập tức chuyển sang mô hình tiếp theo trong danh sách dự phòng!
+        if (isNotFound404) {
+          console.warn(
+            `[Gemini Engine] Mô hình "${currentModel}" trả về mã 404. Lập tức chuyển sang mô hình dự phòng tiếp theo...`
+          );
+          break; // Thoát vòng lặp attempt để nhảy sang model tiếp theo trong queue
+        }
+
+        // 2. Trường hợp Lỗi 429 (Hết hạn mức Quota) hoặc 500/503 (Máy chủ Google quá tải):
+        if (isQuota429 || isServerOverload500_503) {
+          if (attempt < maxRetriesThisModel) {
+            // Chờ Exponential Backoff có thêm độ trễ ngẫu nhiên Jitter
+            const waitTime = (attempt + 1) * 1200 + Math.floor(Math.random() * 400);
+            console.log(
+              `[Gemini Engine] Đang chờ ${waitTime}ms để máy chủ ổn định rồi thử lại mô hình "${currentModel}"...`
+            );
+            await new Promise((resolve) => setTimeout(resolve, waitTime));
+            continue; // Thử lại mô hình hiện tại
+          } else {
+            // Đã hết số lần thử trên mô hình này -> Chuyển sang mô hình tiếp theo
+            console.log(
+              `[Gemini Engine] Mô hình "${currentModel}" đã đạt giới hạn lần thử. Chuyển sang mô hình dự phòng...`
+            );
+            break;
+          }
+        }
+
+        // 3. Các lỗi mạng tạm thời khác (fetch failed, ECONNRESET, timeout)
+        if (errMsg.includes('fetch failed') || errMsg.includes('ECONNRESET') || errMsg.includes('timeout')) {
+          if (attempt < maxRetriesThisModel) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            continue;
+          }
+        }
+
+        // Với các lỗi khác, chuyển sang mô hình tiếp theo
+        break;
       }
+    }
+
+    // Tạm nghỉ 350ms trước khi chuyển sang mô hình mới để giải phóng kết nối
+    if (modelIndex < queue.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 350));
     }
   }
 
-  const isAllQuota =
-    lastError?.status === 'RESOURCE_EXHAUSTED' ||
-    lastError?.message?.includes('429') ||
-    lastError?.message?.includes('Quota exceeded');
+  // Nếu tất cả các mô hình trong queue đều không thành công, phân loại thông báo lỗi chuẩn xác:
+  const finalMsg = String(lastError?.message || lastError || '');
 
-  if (isAllQuota) {
+  if (finalMsg.includes('429') || finalMsg.includes('RESOURCE_EXHAUSTED') || finalMsg.includes('Quota exceeded')) {
     throw new Error(
-      'Hạn mức yêu cầu miễn phí của Google AI (Quota 429) hiện đang tạm đầy. Vui lòng thử lại sau ít phút.'
+      'Hạn mức yêu cầu miễn phí của Google AI (Mã 429) hiện đang tạm đầy trên toàn bộ các mô hình. Hệ thống đã tự động thử các mô hình dự phòng nhưng chưa sẵn sàng. Vui lòng thử lại sau 1-2 phút.'
     );
   }
 
-  throw lastError;
+  if (finalMsg.includes('503') || finalMsg.includes('overloaded') || finalMsg.includes('UNAVAILABLE')) {
+    throw new Error(
+      'Hạ tầng máy chủ Google AI hiện đang quá tải tạm thời (Mã 503). Hệ thống đã xoay tua qua các mô hình dự phòng. Vui lòng bấm thử lại để tiếp tục.'
+    );
+  }
+
+  if (finalMsg.includes('404') || finalMsg.includes('NOT_FOUND')) {
+    throw new Error(
+      'Mô hình AI yêu cầu tạm thời không tìm thấy (Mã 404). Hệ thống đã tự động kích hoạt chế độ dự phòng. Vui lòng thử lại.'
+    );
+  }
+
+  throw new Error(`Lỗi kết nối Gemini AI: ${finalMsg}`);
 }
 
 function normalizeMimeType(mime: string): string {
@@ -369,7 +482,8 @@ app.get(['/api/health', '/health'], (req: Request, res: Response) => {
   res.json({
     status: 'ok',
     hasApiKey: !!process.env.GEMINI_API_KEY,
-    model: FAST_MODEL,
+    primaryModel: PRIMARY_MODEL,
+    fallbackModels: CANDIDATE_MODELS,
     time: new Date().toISOString(),
   });
 });

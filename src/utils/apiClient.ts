@@ -63,13 +63,19 @@ export async function authFetch(
         headers,
       });
 
-      // Nếu gặp mã lỗi máy chủ quá tải tạm thời (502, 503, 504), thử lại
+      // Nếu gặp mã lỗi quá tải, hết hạn mức tạm thời hoặc lỗi máy chủ (429, 500, 502, 503, 504), tự động thử lại
       if (
-        (response.status === 502 || response.status === 503 || response.status === 504) &&
+        (response.status === 429 ||
+          response.status === 500 ||
+          response.status === 502 ||
+          response.status === 503 ||
+          response.status === 504) &&
         attempt < maxRetries
       ) {
-        console.warn(`[authFetch] Máy chủ phản hồi mã ${response.status}. Đang thử lại (lần ${attempt + 1})...`);
-        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+        console.warn(
+          `[authFetch] Máy chủ phản hồi mã ${response.status}. Đang thử lại (lần ${attempt + 1}/${maxRetries})...`
+        );
+        await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
         continue;
       }
 
